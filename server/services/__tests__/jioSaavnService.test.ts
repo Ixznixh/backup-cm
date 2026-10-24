@@ -8,6 +8,7 @@ import {
   artistSimilarity,
   buildTitleVariants,
   buildMatchHypotheses,
+  isLabelCredit,
   SaavnCandidateMeta,
 } from '../jioSaavnService';
 
@@ -110,6 +111,36 @@ describe('JioSaavn — messy YouTube Music metadata', () => {
     expect(
       buildMatchHypotheses('A | B | C | D | E', 'Some Artist Name Here').length
     ).toBeLessThanOrEqual(3);
+  });
+});
+
+describe('JioSaavn — label credits and video-length durations', () => {
+  it('recognises label and channel credits as non-performers', () => {
+    expect(isLabelCredit('Think Music India')).toBe(true);
+    expect(isLabelCredit('Sony Music South')).toBe(true);
+    expect(isLabelCredit('Kappa TV')).toBe(true);
+    expect(isLabelCredit('Anirudh Ravichander')).toBe(false);
+    expect(isLabelCredit('Sean Roldan')).toBe(false);
+  });
+
+  it('accepts an exact title when the catalogued copy is shorter than the video', () => {
+    // Real case: "Ezhutha Kadhaiyo" is 272s in the feed (the video) and 194s in the catalogue.
+    const saavnTrack = { title: 'Ezhutha Kadhaiyo', artist: 'Sean Roldan, Meha Agarwal', duration: 194 };
+    expect(
+      pickBestMatch([saavnTrack], {
+        title: 'Ezhutha Kadhaiyo',
+        artist: 'Think Music India',
+        durationSec: 272,
+      })?.duration
+    ).toBe(194);
+  });
+
+  it('still rejects a near-titled different song', () => {
+    // "Sait Ji" and "Great Ji" are different tracks on the same album.
+    const other = { title: 'Great Ji', artist: 'Hiphop Tamizha, Thamizh Aadhavan', duration: 261 };
+    expect(
+      pickBestMatch([other], { title: 'Sait Ji', artist: 'Hiphop Tamizha', durationSec: 263 })
+    ).toBeNull();
   });
 });
 

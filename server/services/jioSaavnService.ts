@@ -148,6 +148,18 @@ export function scoreCandidate(candidate: SaavnCandidateMeta, target: SaavnMatch
 }
 
 /**
+ * YouTube Music lists labels and channels as the artist for licensed uploads ("Think Music
+ * India", "Sony Music South", "Kappa TV"). Those are not performers, so they must not be
+ * used to reject an otherwise exact title match.
+ */
+export function isLabelCredit(artist: string | null | undefined): boolean {
+  if (!artist) return false;
+  return /\b(music|records|studios?|entertainment|official|label|audio|tv|films?|productions?)\b/i.test(
+    artist
+  );
+}
+
+/**
  * Picks the candidate whose audio is the same recording as the target track.
  * Returns null when nothing is convincing — the caller must then not play a wrong song.
  */
@@ -176,16 +188,32 @@ export function pickBestMatch<T extends SaavnCandidateMeta>(candidates: T[], tar
     target.durationSec && best.duration > 0 ? Math.abs(best.duration - target.durationSec) : null;
 
   const exactTitle = normalizeForMatch(best.title) === normalizeForMatch(target.title);
-  const artistKnown = targetArtist.size > 0;
+  // A label/channel credit carries no information about which recording this is.
+  const artistKnown = targetArtist.size > 0 && !isLabelCredit(target.artist);
   const artistOk = !artistKnown || artistScore >= 0.25;
 
-  // Catalogue copies of the same recording can differ in length (edits, extended intros).
-  // Accept that only when the title and artist both point at the same recording, otherwise
-  // a length mismatch means we found a different version and must not play it.
+  // Catalogue copies of the same recording can differ in length (edits, extended intros), and
+  // the feed's duration is often the *video* length rather than the song's. An exact title
+  // with a matching artist — or with no real artist credit at all — is trusted at any length;
+  // otherwise a length mismatch means we found a different version and must not play it.
   const durationOk =
-    durationDelta === null || durationDelta <= 12 || (exactTitle && artistScore >= 0.34);
+    durationDelta === null ||
+    durationDelta <= 12 ||
+    (exactTitle && (artistScore >= 0.34 || !artistKnown));
 
-  return titleScore >= 0.5 && durationOk && (artistOk || (durationDelta !== null && durationDelta <= 4)) && bestScore >= 0.5
+  // Require most of the *target* title to appear in the candidate, not just a majority of the
+  // union. Two-word titles that share one word ("Sait Ji" vs "Great Ji") reach 0.5 dice and
+  // would otherwise play a different song from the same album, which is worse than skipping.
+  // The reverse case still passes: "Kesariya" vs "Kesariya (Lofi Flip)" is 100% coverage.
+  const bestTokens = tokenSet(best.title);
+  let sharedTokens = 0;
+  for (const token of targetTitle) {
+    if (bestTokens.has(token)) sharedTokens++;
+  }
+  const targetCoverage = targetTitle.size > 0 ? sharedTokens / targetTitle.size : 0;
+  const titleOk = targetCoverage >= 0.7 || exactTitle || titleScore >= 0.8;
+
+  return titleOk && durationOk && (artistOk || (durationDelta !== null && durationDelta <= 4)) && bestScore >= 0.5
     ? best
     : null;
 }
@@ -327,6 +355,8 @@ class JioSaavnService {
   private searchCache = new Map<string, { tracks: SaavnTrack[]; expires: number }>();
   private inflightSearches = new Map<string, Promise<SaavnTrack[]>>();
   private trackCache = new Map<string, { track: SaavnTrack | null; expires: number }>();
+  private albumCache = new Map<string, { tracks: SaavnTrack[]; expires: number }>();
+  private inflightAlbums = new Map<string, Promise<SaavnTrack[]>>();
 
   public isConfigured(): boolean {
     return true;
@@ -339,14 +369,15 @@ class JioSaavnService {
   public async findTrack(
     title: string,
     artist?: string,
-    durationSec?: number
+    durationSec?: number,
+    album?: string
   ): Promise<SaavnTrack | null> {
     const cleanTitle = (title || '').trim();
     if (!cleanTitle) return null;
 
-    const cacheKey = `${normalizeForMatch(cleanTitle)}|${normalizeForMatch(artist)}|${Math.round(
-      durationSec || 0
-    )}`;
+    const cacheKey = `${normalizeForMatch(cleanTitle)}|${normalizeForMatch(artist)}|${normalizeForMatch(
+      album
+    )}|${Math.round(durationSec || 0)}`;
 
     const cached = this.trackCache.get(cacheKey);
     if (cached && cached.expires > Date.now()) {
@@ -379,6 +410,21 @@ class JioSaavnService {
       if (match) break;
     }
 
+    // Last pass: catalogue search ranks popular tracks above album deep cuts, so a real
+    // album track can be missing from the result page entirely. Looking inside the album
+    // itself finds it by name.
+    if (!match && album) {
+      const albumTracks = await this.findAlbumTracks(album, artist);
+      for (const hypothesis of hypotheses) {
+        match = pickBestMatch(albumTracks, {
+          title: hypothesis.title,
+          artist: hypothesis.artist,
+          durationSec,
+        });
+        if (match) break;
+      }
+    }
+
     this.remember(this.trackCache, cacheKey, { track: match, expires: Date.now() + SEARCH_TTL_MS });
     return match;
   }
@@ -391,7 +437,90 @@ class JioSaavnService {
     return null;
   }
 
+  /**
+   * Resolves an album name to its track list.
+   *
+   * Catalogue search ranks popular songs above album deep cuts, so a track that definitely
+   * exists can be absent from the result page. Loading its album finds it by name instead.
+   */
+  private async findAlbumTracks(albumName: string, artist?: string): Promise<SaavnTrack[]> {
+    const key = `${normalizeForMatch(albumName)}|${normalizeForMatch(artist)}`;
+
+    const cached = this.albumCache.get(key);
+    if (cached && cached.expires > Date.now()) return cached.tracks;
+
+    const inflight = this.inflightAlbums.get(key);
+    if (inflight) return inflight;
+
+    const task = this.requestAlbumTracks(albumName)
+      .then((tracks) => {
+        this.remember(this.albumCache, key, { tracks, expires: Date.now() + SEARCH_TTL_MS });
+        return tracks;
+      })
+      .catch((err: any) => {
+        console.info('[JioSaavn] album lookup unavailable:', err?.message || String(err));
+        return [] as SaavnTrack[];
+      })
+      .finally(() => {
+        this.inflightAlbums.delete(key);
+      });
+
+    this.inflightAlbums.set(key, task);
+    return task;
+  }
+
+  private async requestAlbumTracks(albumName: string): Promise<SaavnTrack[]> {
+    const search = await this.requestApi({
+      __call: 'search.getAlbumResults',
+      q: albumName,
+      p: '1',
+      n: '6',
+    });
+
+    const results: any[] = Array.isArray(search?.results) ? search.results : [];
+    const targetAlbum = tokenSet(albumName);
+
+    // Only the two closest album matches are opened: unrelated albums are pure extra latency.
+    const albums = results
+      .filter((album) => album?.id)
+      .map((album) => ({
+        id: String(album.id),
+        score: tokenSimilarity(targetAlbum, tokenSet(String(album.title || ''))),
+      }))
+      .filter((album) => album.score >= 0.4)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 2);
+
+    const lists = await Promise.all(
+      albums.map(async (album) => {
+        try {
+          const details = await this.requestApi({
+            __call: 'content.getAlbumDetails',
+            albumid: album.id,
+          });
+          return Array.isArray(details?.list) ? details.list : [];
+        } catch {
+          return [];
+        }
+      })
+    );
+
+    const tracks = new Map<string, SaavnTrack>();
+    for (const raw of lists.flat()) {
+      if (raw?.type && raw.type !== 'song') continue;
+      const track = toTrack(raw);
+      if (track && !tracks.has(track.id)) tracks.set(track.id, track);
+    }
+    return [...tracks.values()];
+  }
+
   private buildQuery(title: string, artist?: string): string {
+    // A label credit in the query buries the song ("Ezhutha Kadhaiyo Think Music" returns
+    // nothing useful), so search on the title alone in that case.
+    if (isLabelCredit(artist)) {
+      return title.replace(/\(.*?\)|\[.*?\]/g, ' ').replace(/\s+/g, ' ').trim();
+    }
+
     const primaryArtist = (artist || '')
       .split(/[,&]|feat\.?|ft\.?/i)[0]
       .replace(/\(.*?\)|\[.*?\]/g, ' ')
@@ -430,19 +559,16 @@ class JioSaavnService {
     return task;
   }
 
-  private async requestSearch(query: string): Promise<SaavnTrack[]> {
-    const params = new URLSearchParams({
-      __call: 'search.getResults',
-      q: query,
+  private async requestApi(params: Record<string, string>): Promise<any> {
+    const query = new URLSearchParams({
       _format: 'json',
       _marker: '0',
       api_version: '4',
       ctx: 'web6dot0',
-      n: '12',
-      p: '1',
+      ...params,
     });
 
-    const response = await fetch(`${SAAVN_API}?${params.toString()}`, {
+    const response = await fetch(`${SAAVN_API}?${query.toString()}`, {
       headers: {
         'User-Agent': SAAVN_USER_AGENT,
         Accept: 'application/json, text/plain, */*',
@@ -452,10 +578,20 @@ class JioSaavnService {
     });
 
     if (!response.ok) {
-      throw new Error(`JioSaavn search HTTP ${response.status}`);
+      throw new Error(`JioSaavn ${params.__call} HTTP ${response.status}`);
     }
 
-    const payload: any = await response.json();
+    return response.json();
+  }
+
+  private async requestSearch(query: string): Promise<SaavnTrack[]> {
+    const payload = await this.requestApi({
+      __call: 'search.getResults',
+      q: query,
+      n: '12',
+      p: '1',
+    });
+
     const results: any[] = Array.isArray(payload?.results) ? payload.results : [];
 
     const tracks: SaavnTrack[] = [];

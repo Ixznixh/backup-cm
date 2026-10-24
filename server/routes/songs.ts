@@ -54,6 +54,7 @@ export async function handleAudioStreamProxy(req: Request, res: Response) {
     const stream = await youtubeMusicService.getStream(targetVidId, {
       title: queryTitle,
       artist: queryArtist,
+      album: queryAlbum,
       duration: queryDuration,
     });
 
@@ -263,7 +264,7 @@ songsRouter.get('/resolve', async (req: Request, res: Response) => {
   // Resolve the real stream for this track. When it is a CDN URL the client can play
   // directly, hand it over so playback needs no further server round trip.
   try {
-    const stream = await youtubeMusicService.getStream(id, { title, artist, duration });
+    const stream = await youtubeMusicService.getStream(id, { title, artist, album, duration });
     if (stream?.available && stream.streamUrl) {
       return res.json({
         success: true,
@@ -337,10 +338,11 @@ songsRouter.post('/prepare', async (req: Request, res: Response) => {
 
       const title = String(track.title || '').trim();
       const artist = String(track.artist || '').trim();
+      const album = String(track.album || '').trim();
       const duration = parseInt(String(track.duration || '0'), 10) || undefined;
 
       try {
-        const stream = await youtubeMusicService.getStream(id, { title, artist, duration });
+        const stream = await youtubeMusicService.getStream(id, { title, artist, album, duration });
         if (stream?.available && stream.streamUrl && isDirectPlayableCdnUrl(stream.streamUrl)) {
           return { id, streamUrl: stream.streamUrl, duration: stream.duration };
         }
@@ -359,6 +361,7 @@ songsRouter.get('/:id/prewarm', async (req: Request, res: Response) => {
   const id = rawId.replace(/^(yt_liked_|yt_top_|yt_sync_)/, '').trim();
   const title = String(req.query.title || '').trim();
   const artist = String(req.query.artist || '').trim();
+  const album = String(req.query.album || '').trim();
   const durationHint = parseInt(String(req.query.duration || '0'), 10) || undefined;
 
   // Prewarm awaits the real resolution (it runs ~30s before the track ends), so the next
@@ -370,6 +373,7 @@ songsRouter.get('/:id/prewarm', async (req: Request, res: Response) => {
       const stream = await youtubeMusicService.getStream(id, {
         title,
         artist,
+        album,
         duration: durationHint,
       });
       if (stream?.available && typeof stream.streamUrl === 'string') {

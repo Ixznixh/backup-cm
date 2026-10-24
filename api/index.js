@@ -324,6 +324,12 @@ function scoreCandidate(candidate, target) {
   }
   return 0.62 * titleScore + 0.23 * artistScore + 0.15 * durationScore;
 }
+function isLabelCredit(artist) {
+  if (!artist) return false;
+  return /\b(music|records|studios?|entertainment|official|label|audio|tv|films?|productions?)\b/i.test(
+    artist
+  );
+}
 function pickBestMatch(candidates, target) {
   if (!target.title || candidates.length === 0) return null;
   const targetTitle = tokenSet(target.title);
@@ -342,10 +348,17 @@ function pickBestMatch(candidates, target) {
   const artistScore = artistSimilarity(target.artist, best.artist);
   const durationDelta = target.durationSec && best.duration > 0 ? Math.abs(best.duration - target.durationSec) : null;
   const exactTitle = normalizeForMatch(best.title) === normalizeForMatch(target.title);
-  const artistKnown = targetArtist.size > 0;
+  const artistKnown = targetArtist.size > 0 && !isLabelCredit(target.artist);
   const artistOk = !artistKnown || artistScore >= 0.25;
-  const durationOk = durationDelta === null || durationDelta <= 12 || exactTitle && artistScore >= 0.34;
-  return titleScore >= 0.5 && durationOk && (artistOk || durationDelta !== null && durationDelta <= 4) && bestScore >= 0.5 ? best : null;
+  const durationOk = durationDelta === null || durationDelta <= 12 || exactTitle && (artistScore >= 0.34 || !artistKnown);
+  const bestTokens = tokenSet(best.title);
+  let sharedTokens = 0;
+  for (const token of targetTitle) {
+    if (bestTokens.has(token)) sharedTokens++;
+  }
+  const targetCoverage = targetTitle.size > 0 ? sharedTokens / targetTitle.size : 0;
+  const titleOk = targetCoverage >= 0.7 || exactTitle || titleScore >= 0.8;
+  return titleOk && durationOk && (artistOk || durationDelta !== null && durationDelta <= 4) && bestScore >= 0.5 ? best : null;
 }
 function buildTitleVariants(rawTitle) {
   const variants = [];
@@ -473,6 +486,8 @@ var init_jioSaavnService = __esm({
         this.searchCache = /* @__PURE__ */ new Map();
         this.inflightSearches = /* @__PURE__ */ new Map();
         this.trackCache = /* @__PURE__ */ new Map();
+        this.albumCache = /* @__PURE__ */ new Map();
+        this.inflightAlbums = /* @__PURE__ */ new Map();
       }
       isConfigured() {
         return true;
@@ -481,12 +496,12 @@ var init_jioSaavnService = __esm({
        * Finds the Saavn track that corresponds to a YouTube Music track.
        * One HTTP request on a cache miss; cached for 6 hours afterwards.
        */
-      async findTrack(title, artist, durationSec) {
+      async findTrack(title, artist, durationSec, album) {
         const cleanTitle = (title || "").trim();
         if (!cleanTitle) return null;
-        const cacheKey = `${normalizeForMatch(cleanTitle)}|${normalizeForMatch(artist)}|${Math.round(
-          durationSec || 0
-        )}`;
+        const cacheKey = `${normalizeForMatch(cleanTitle)}|${normalizeForMatch(artist)}|${normalizeForMatch(
+          album
+        )}|${Math.round(durationSec || 0)}`;
         const cached = this.trackCache.get(cacheKey);
         if (cached && cached.expires > Date.now()) {
           return cached.track;
@@ -511,6 +526,17 @@ var init_jioSaavnService = __esm({
           });
           if (match) break;
         }
+        if (!match && album) {
+          const albumTracks = await this.findAlbumTracks(album, artist);
+          for (const hypothesis of hypotheses) {
+            match = pickBestMatch(albumTracks, {
+              title: hypothesis.title,
+              artist: hypothesis.artist,
+              durationSec
+            });
+            if (match) break;
+          }
+        }
         this.remember(this.trackCache, cacheKey, { track: match, expires: Date.now() + SEARCH_TTL_MS });
         return match;
       }
@@ -521,7 +547,68 @@ var init_jioSaavnService = __esm({
         }
         return null;
       }
+      /**
+       * Resolves an album name to its track list.
+       *
+       * Catalogue search ranks popular songs above album deep cuts, so a track that definitely
+       * exists can be absent from the result page. Loading its album finds it by name instead.
+       */
+      async findAlbumTracks(albumName, artist) {
+        const key = `${normalizeForMatch(albumName)}|${normalizeForMatch(artist)}`;
+        const cached = this.albumCache.get(key);
+        if (cached && cached.expires > Date.now()) return cached.tracks;
+        const inflight = this.inflightAlbums.get(key);
+        if (inflight) return inflight;
+        const task = this.requestAlbumTracks(albumName).then((tracks) => {
+          this.remember(this.albumCache, key, { tracks, expires: Date.now() + SEARCH_TTL_MS });
+          return tracks;
+        }).catch((err) => {
+          console.info("[JioSaavn] album lookup unavailable:", err?.message || String(err));
+          return [];
+        }).finally(() => {
+          this.inflightAlbums.delete(key);
+        });
+        this.inflightAlbums.set(key, task);
+        return task;
+      }
+      async requestAlbumTracks(albumName) {
+        const search = await this.requestApi({
+          __call: "search.getAlbumResults",
+          q: albumName,
+          p: "1",
+          n: "6"
+        });
+        const results = Array.isArray(search?.results) ? search.results : [];
+        const targetAlbum = tokenSet(albumName);
+        const albums = results.filter((album) => album?.id).map((album) => ({
+          id: String(album.id),
+          score: tokenSimilarity(targetAlbum, tokenSet(String(album.title || "")))
+        })).filter((album) => album.score >= 0.4).sort((a, b) => b.score - a.score).slice(0, 2);
+        const lists = await Promise.all(
+          albums.map(async (album) => {
+            try {
+              const details = await this.requestApi({
+                __call: "content.getAlbumDetails",
+                albumid: album.id
+              });
+              return Array.isArray(details?.list) ? details.list : [];
+            } catch {
+              return [];
+            }
+          })
+        );
+        const tracks = /* @__PURE__ */ new Map();
+        for (const raw of lists.flat()) {
+          if (raw?.type && raw.type !== "song") continue;
+          const track = toTrack(raw);
+          if (track && !tracks.has(track.id)) tracks.set(track.id, track);
+        }
+        return [...tracks.values()];
+      }
       buildQuery(title, artist) {
+        if (isLabelCredit(artist)) {
+          return title.replace(/\(.*?\)|\[.*?\]/g, " ").replace(/\s+/g, " ").trim();
+        }
         const primaryArtist = (artist || "").split(/[,&]|feat\.?|ft\.?/i)[0].replace(/\(.*?\)|\[.*?\]/g, " ").trim();
         const cleanTitle = title.replace(/\(.*?\)|\[.*?\]/g, " ").replace(/\s+/g, " ").trim();
         return primaryArtist ? `${cleanTitle} ${primaryArtist}` : cleanTitle;
@@ -547,18 +634,15 @@ var init_jioSaavnService = __esm({
         this.inflightSearches.set(key, task);
         return task;
       }
-      async requestSearch(query) {
-        const params = new URLSearchParams({
-          __call: "search.getResults",
-          q: query,
+      async requestApi(params) {
+        const query = new URLSearchParams({
           _format: "json",
           _marker: "0",
           api_version: "4",
           ctx: "web6dot0",
-          n: "12",
-          p: "1"
+          ...params
         });
-        const response = await fetch(`${SAAVN_API}?${params.toString()}`, {
+        const response = await fetch(`${SAAVN_API}?${query.toString()}`, {
           headers: {
             "User-Agent": SAAVN_USER_AGENT,
             Accept: "application/json, text/plain, */*",
@@ -567,9 +651,17 @@ var init_jioSaavnService = __esm({
           signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
         });
         if (!response.ok) {
-          throw new Error(`JioSaavn search HTTP ${response.status}`);
+          throw new Error(`JioSaavn ${params.__call} HTTP ${response.status}`);
         }
-        const payload = await response.json();
+        return response.json();
+      }
+      async requestSearch(query) {
+        const payload = await this.requestApi({
+          __call: "search.getResults",
+          q: query,
+          n: "12",
+          p: "1"
+        });
         const results = Array.isArray(payload?.results) ? payload.results : [];
         const tracks = [];
         for (const raw of results) {
@@ -593,6 +685,16 @@ var init_jioSaavnService = __esm({
 
 // server/services/youtubeMusic.ts
 import { Innertube, Parser, Log } from "youtubei.js";
+function isPlayableSongEntry(song) {
+  if (!song) return false;
+  const title = String(song.title || "").trim();
+  if (!title) return false;
+  if (song.duration && song.duration > MAX_SONG_DURATION_SECONDS) return false;
+  if (/^(jukebox|music|songs|playlist|full album|mixtape|mashup)$/i.test(title)) return false;
+  if (/\b(music|songs|jukebox|playlist|full album|mixtape|mashup)\s*$/i.test(title)) return false;
+  if (/\b(music|songs|tv)\s*$/i.test(String(song.artist || "").trim())) return false;
+  return true;
+}
 function normalizeTitleTokens(title) {
   if (!title) return [];
   return title.toLowerCase().replace(/\[[^\]]*\]/g, "").replace(/\([^)]*\)/g, "").replace(/\b(official|video|audio|lyric|lyrics|full|song|remix|lofi|hd|4k|mv|remastered|version|visualizer)\b/gi, "").replace(/[^a-z0-9\s]/gi, "").trim().split(/\s+/).filter((w) => w.length > 1);
@@ -800,13 +902,14 @@ function isTitleTooSimilar(titleA, titleB) {
   const simB = overlap / tokensB.length;
   return simA >= 0.5 || simB >= 0.5;
 }
-var PlayerInterstitialNode, InterstitialViewNode, QUICK_PICKS_QUERY_POOL, YouTubeMusicService, youtubeMusicService;
+var MAX_SONG_DURATION_SECONDS, PlayerInterstitialNode, InterstitialViewNode, QUICK_PICKS_QUERY_POOL, YouTubeMusicService, youtubeMusicService;
 var init_youtubeMusic = __esm({
   "server/services/youtubeMusic.ts"() {
     init_formatters();
     init_geminiLyrics();
     init_jioSaavnService();
     Log.setLevel(Log.Level.NONE);
+    MAX_SONG_DURATION_SECONDS = 15 * 60;
     PlayerInterstitialNode = class {
       static {
         this.type = "PlayerInterstitial";
@@ -1385,7 +1488,9 @@ var init_youtubeMusic = __esm({
                   this.search(qA, "song", true).catch(() => ({ songs: [] })),
                   this.search(qB, "song", true).catch(() => ({ songs: [] }))
                 ]);
-                const combined = [...res1.songs || [], ...res2.songs || []];
+                const combined = [...res1.songs || [], ...res2.songs || []].filter(
+                  (song) => isPlayableSongEntry(song)
+                );
                 const seen = /* @__PURE__ */ new Set();
                 const uniqueSongs = [];
                 for (const song of combined) {
@@ -1408,7 +1513,7 @@ var init_youtubeMusic = __esm({
                 return;
               }
               const results = await this.search(cat.query, "song", forceRefresh);
-              let items = results.songs || [];
+              let items = (results.songs || []).filter((song) => isPlayableSongEntry(song));
               if (items.length > 0) {
                 if (forceRefresh && items.length > 4) {
                   const topPool = items.slice(0, 6).sort(() => Math.random() - 0.5);
@@ -2068,12 +2173,14 @@ var init_youtubeMusic = __esm({
         const titleToSearch = metadata?.title || cachedSong?.title || "";
         const artistToSearch = metadata?.artist || cachedSong?.artist || cachedSong?.artists || "";
         const durationHint = metadata?.duration || cachedSong?.duration;
+        const albumToSearch = metadata?.album || cachedSong?.album || "";
         if (titleToSearch) {
           try {
             const saavn = await jioSaavnService.findTrack(
               titleToSearch,
               artistToSearch,
-              durationHint
+              durationHint,
+              albumToSearch
             );
             if (saavn?.streamUrl320) {
               const saavnStream = {
@@ -2566,6 +2673,7 @@ async function handleAudioStreamProxy(req, res) {
     const stream = await youtubeMusicService.getStream(targetVidId, {
       title: queryTitle,
       artist: queryArtist,
+      album: queryAlbum,
       duration: queryDuration
     });
     if (stream?.available && stream?.streamUrl && isDirectPlayableCdnUrl(stream.streamUrl)) {
@@ -2747,7 +2855,7 @@ var init_songs = __esm({
         }
       }
       try {
-        const stream = await youtubeMusicService.getStream(id, { title, artist, duration });
+        const stream = await youtubeMusicService.getStream(id, { title, artist, album, duration });
         if (stream?.available && stream.streamUrl) {
           return res.json({
             success: true,
@@ -2807,9 +2915,10 @@ var init_songs = __esm({
           if (!id) return null;
           const title = String(track.title || "").trim();
           const artist = String(track.artist || "").trim();
+          const album = String(track.album || "").trim();
           const duration = parseInt(String(track.duration || "0"), 10) || void 0;
           try {
-            const stream = await youtubeMusicService.getStream(id, { title, artist, duration });
+            const stream = await youtubeMusicService.getStream(id, { title, artist, album, duration });
             if (stream?.available && stream.streamUrl && isDirectPlayableCdnUrl(stream.streamUrl)) {
               return { id, streamUrl: stream.streamUrl, duration: stream.duration };
             }
@@ -2825,6 +2934,7 @@ var init_songs = __esm({
       const id = rawId.replace(/^(yt_liked_|yt_top_|yt_sync_)/, "").trim();
       const title = String(req.query.title || "").trim();
       const artist = String(req.query.artist || "").trim();
+      const album = String(req.query.album || "").trim();
       const durationHint = parseInt(String(req.query.duration || "0"), 10) || void 0;
       let resolvedUrl = "";
       let resolvedDuration;
@@ -2833,6 +2943,7 @@ var init_songs = __esm({
           const stream = await youtubeMusicService.getStream(id, {
             title,
             artist,
+            album,
             duration: durationHint
           });
           if (stream?.available && typeof stream.streamUrl === "string") {

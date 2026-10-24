@@ -1047,6 +1047,7 @@ export class AudioPlayer {
         id: this.cleanStreamId(track.id),
         title: track.title || '',
         artist: track.artist || '',
+        album: track.album || '',
         duration: Math.round(Number(track.duration) || 0),
       })),
     };

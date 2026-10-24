@@ -14,6 +14,33 @@ import { jioSaavnService } from './jioSaavnService';
 // Set Innertube logging level to NONE to completely eliminate benign parser warnings on YouTube's changing UI schemas
 Log.setLevel(Log.Level.NONE);
 
+/** Longest a single track can plausibly be; anything longer is a compilation upload. */
+const MAX_SONG_DURATION_SECONDS = 15 * 60;
+
+/**
+ * Drops feed entries that are not individual songs.
+ *
+ * YouTube Music's search results mix real songs with jukebox compilations, playlists and
+ * radio uploads that are shaped exactly like a song. They are 60-100 minutes long and can never
+ * resolve to one track's audio, so they showed up as songs that refused to play.
+ */
+export function isPlayableSongEntry(
+  song: { title?: string; artist?: string; duration?: number } | null | undefined
+): boolean {
+  if (!song) return false;
+
+  const title = String(song.title || '').trim();
+  if (!title) return false;
+
+  if (song.duration && song.duration > MAX_SONG_DURATION_SECONDS) return false;
+
+  if (/^(jukebox|music|songs|playlist|full album|mixtape|mashup)$/i.test(title)) return false;
+  if (/\b(music|songs|jukebox|playlist|full album|mixtape|mashup)\s*$/i.test(title)) return false;
+  if (/\b(music|songs|tv)\s*$/i.test(String(song.artist || '').trim())) return false;
+
+  return true;
+}
+
 // Register runtime node handlers for YouTube interstitial/ad nodes to avoid missing class warnings
 class PlayerInterstitialNode {
   static type = 'PlayerInterstitial';
@@ -925,7 +952,9 @@ class YouTubeMusicService {
               this.search(qA, 'song', true).catch(() => ({ songs: [] })),
               this.search(qB, 'song', true).catch(() => ({ songs: [] })),
             ]);
-            const combined = [...(res1.songs || []), ...(res2.songs || [])];
+            const combined = [...(res1.songs || []), ...(res2.songs || [])].filter((song) =>
+              isPlayableSongEntry(song)
+            );
             const seen = new Set<string>();
             const uniqueSongs: Song[] = [];
             for (const song of combined) {
@@ -949,7 +978,7 @@ class YouTubeMusicService {
           }
 
           const results = await this.search(cat.query, 'song', forceRefresh);
-          let items = results.songs || [];
+          let items = (results.songs || []).filter((song) => isPlayableSongEntry(song));
           if (items.length > 0) {
             if (forceRefresh && items.length > 4) {
               const topPool = items.slice(0, 6).sort(() => Math.random() - 0.5);
@@ -1728,7 +1757,7 @@ class YouTubeMusicService {
    */
   public async getStream(
     id: string,
-    metadata?: { title?: string; artist?: string; duration?: number }
+    metadata?: { title?: string; artist?: string; album?: string; duration?: number }
   ): Promise<StreamInfo> {
     if (!id || typeof id !== 'string' || id.trim().length === 0) {
       return {
@@ -1765,13 +1794,15 @@ class YouTubeMusicService {
     const artistToSearch =
       metadata?.artist || cachedSong?.artist || (cachedSong as any)?.artists || '';
     const durationHint = metadata?.duration || cachedSong?.duration;
+    const albumToSearch = metadata?.album || cachedSong?.album || '';
 
     if (titleToSearch) {
       try {
         const saavn = await jioSaavnService.findTrack(
           titleToSearch,
           artistToSearch,
-          durationHint
+          durationHint,
+          albumToSearch
         );
         if (saavn?.streamUrl320) {
           const saavnStream: StreamInfo = {
