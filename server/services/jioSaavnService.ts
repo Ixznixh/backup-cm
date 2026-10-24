@@ -239,6 +239,18 @@ export function buildTitleVariants(rawTitle: string): string[] {
 
   push(rawTitle);
 
+  // Presentational suffixes name the same recording ("Film Version", "Lyrical Video").
+  // Remix/cover style suffixes are deliberately not stripped: those are different audio.
+  const withoutQualifier = rawTitle
+    .replace(
+      /\s*[([-]?\s*\b(film version|video song|full video|lyrical video|lyric video|official video|video song|video|lyrical|lyrics)\b[)\]]?\s*$/i,
+      ''
+    )
+    .trim();
+  if (withoutQualifier && normalizeForMatch(withoutQualifier) !== normalizeForMatch(rawTitle)) {
+    push(withoutQualifier);
+  }
+
   if (rawTitle.includes('|')) {
     rawTitle
       .split('|')
@@ -388,12 +400,17 @@ class JioSaavnService {
 
     // Search every hypothesis at once (usually just one request) and match against the
     // combined candidate pool, so a messy title costs no extra round trips.
-    const resultSets = await Promise.all(
+    // A rejected search means the catalogue was unreachable, not that the track is missing —
+    // that distinction decides whether the result may be cached below.
+    const resultSets = await Promise.allSettled(
       hypotheses.map((hypothesis) => this.search(this.buildQuery(hypothesis.title, hypothesis.artist)))
     );
+    let searchFailed = resultSets.some((result) => result.status === 'rejected');
+
     const pool = new Map<string, SaavnTrack>();
-    for (const tracks of resultSets) {
-      for (const track of tracks) {
+    for (const result of resultSets) {
+      if (result.status !== 'fulfilled') continue;
+      for (const track of result.value) {
         if (!pool.has(track.id)) pool.set(track.id, track);
       }
     }
@@ -410,22 +427,50 @@ class JioSaavnService {
       if (match) break;
     }
 
-    // Last pass: catalogue search ranks popular tracks above album deep cuts, so a real
-    // album track can be missing from the result page entirely. Looking inside the album
-    // itself finds it by name.
-    if (!match && album) {
-      const albumTracks = await this.findAlbumTracks(album, artist);
-      for (const hypothesis of hypotheses) {
-        match = pickBestMatch(albumTracks, {
-          title: hypothesis.title,
-          artist: hypothesis.artist,
-          durationSec,
-        });
-        if (match) break;
+    // Second round without the artist. An artist credit that is a distributor or a channel
+    // ("T-Series Telugu", "Saregama", ...) makes the query return nothing relevant, and the
+    // cost is paid only by tracks that would otherwise fail.
+    if (!match && hypotheses.length > 0) {
+      try {
+        const bareTracks = await this.search(hypotheses[0].title);
+        for (const hypothesis of hypotheses) {
+          match = pickBestMatch(bareTracks, {
+            title: hypothesis.title,
+            artist: hypothesis.artist,
+            durationSec,
+          });
+          if (match) break;
+        }
+      } catch {
+        searchFailed = true;
       }
     }
 
-    this.remember(this.trackCache, cacheKey, { track: match, expires: Date.now() + SEARCH_TTL_MS });
+    // Last pass: catalogue search ranks popular tracks above album deep cuts, so a real
+    // album track can be missing from the result page entirely. Looking inside the album
+    // itself finds it by name.
+    let albumFailed = false;
+    if (!match && album) {
+      try {
+        const albumTracks = await this.findAlbumTracks(album, artist);
+        for (const hypothesis of hypotheses) {
+          match = pickBestMatch(albumTracks, {
+            title: hypothesis.title,
+            artist: hypothesis.artist,
+            durationSec,
+          });
+          if (match) break;
+        }
+      } catch {
+        albumFailed = true;
+      }
+    }
+
+    // Only cache a definitive answer. Caching a miss caused by a timeout or a rate limit would
+    // silence that track for six hours after a single bad moment.
+    if (!searchFailed && !albumFailed) {
+      this.remember(this.trackCache, cacheKey, { track: match, expires: Date.now() + SEARCH_TTL_MS });
+    }
     return match;
   }
 
@@ -456,10 +501,6 @@ class JioSaavnService {
       .then((tracks) => {
         this.remember(this.albumCache, key, { tracks, expires: Date.now() + SEARCH_TTL_MS });
         return tracks;
-      })
-      .catch((err: any) => {
-        console.info('[JioSaavn] album lookup unavailable:', err?.message || String(err));
-        return [] as SaavnTrack[];
       })
       .finally(() => {
         this.inflightAlbums.delete(key);
@@ -546,10 +587,6 @@ class JioSaavnService {
       .then((tracks) => {
         this.remember(this.searchCache, key, { tracks, expires: Date.now() + SEARCH_TTL_MS });
         return tracks;
-      })
-      .catch((err: any) => {
-        console.info('[JioSaavn] search unavailable:', err?.message || String(err));
-        return [];
       })
       .finally(() => {
         this.inflightSearches.delete(key);

@@ -95,6 +95,13 @@ describe('JioSaavn — messy YouTube Music metadata', () => {
     expect(variants).toContain('Karthi');
   });
 
+  it('strips presentational suffixes but keeps remix qualifiers', () => {
+    expect(buildTitleVariants('Andhamaa Andhamaa Film Version')).toContain('Andhamaa Andhamaa');
+    expect(buildTitleVariants('Nira - Lyrical Video')).toContain('Nira');
+    // A remix is different audio, so it must never be reduced to the original title.
+    expect(buildTitleVariants('Kesariya Lofi Remix')).not.toContain('Kesariya');
+  });
+
   it('tries the artist field as the song name for video-style titles', () => {
     // Real case: the feed entry's title is a cast list, its artist field is the song name.
     const hypotheses = buildMatchHypotheses('| Sardar 2 | Karthi | Malavika Mohanan | Sam CS', 'Mayil Veera');

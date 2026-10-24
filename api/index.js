@@ -371,6 +371,13 @@ function buildTitleVariants(rawTitle) {
     variants.push(trimmed);
   };
   push(rawTitle);
+  const withoutQualifier = rawTitle.replace(
+    /\s*[([-]?\s*\b(film version|video song|full video|lyrical video|lyric video|official video|video song|video|lyrical|lyrics)\b[)\]]?\s*$/i,
+    ""
+  ).trim();
+  if (withoutQualifier && normalizeForMatch(withoutQualifier) !== normalizeForMatch(rawTitle)) {
+    push(withoutQualifier);
+  }
   if (rawTitle.includes("|")) {
     rawTitle.split("|").map((segment) => segment.trim()).filter((segment) => segment.length > 1).forEach(push);
   }
@@ -507,12 +514,14 @@ var init_jioSaavnService = __esm({
           return cached.track;
         }
         const hypotheses = buildMatchHypotheses(cleanTitle, artist);
-        const resultSets = await Promise.all(
+        const resultSets = await Promise.allSettled(
           hypotheses.map((hypothesis) => this.search(this.buildQuery(hypothesis.title, hypothesis.artist)))
         );
+        let searchFailed = resultSets.some((result) => result.status === "rejected");
         const pool = /* @__PURE__ */ new Map();
-        for (const tracks of resultSets) {
-          for (const track of tracks) {
+        for (const result of resultSets) {
+          if (result.status !== "fulfilled") continue;
+          for (const track of result.value) {
             if (!pool.has(track.id)) pool.set(track.id, track);
           }
         }
@@ -526,18 +535,40 @@ var init_jioSaavnService = __esm({
           });
           if (match) break;
         }
-        if (!match && album) {
-          const albumTracks = await this.findAlbumTracks(album, artist);
-          for (const hypothesis of hypotheses) {
-            match = pickBestMatch(albumTracks, {
-              title: hypothesis.title,
-              artist: hypothesis.artist,
-              durationSec
-            });
-            if (match) break;
+        if (!match && hypotheses.length > 0) {
+          try {
+            const bareTracks = await this.search(hypotheses[0].title);
+            for (const hypothesis of hypotheses) {
+              match = pickBestMatch(bareTracks, {
+                title: hypothesis.title,
+                artist: hypothesis.artist,
+                durationSec
+              });
+              if (match) break;
+            }
+          } catch {
+            searchFailed = true;
           }
         }
-        this.remember(this.trackCache, cacheKey, { track: match, expires: Date.now() + SEARCH_TTL_MS });
+        let albumFailed = false;
+        if (!match && album) {
+          try {
+            const albumTracks = await this.findAlbumTracks(album, artist);
+            for (const hypothesis of hypotheses) {
+              match = pickBestMatch(albumTracks, {
+                title: hypothesis.title,
+                artist: hypothesis.artist,
+                durationSec
+              });
+              if (match) break;
+            }
+          } catch {
+            albumFailed = true;
+          }
+        }
+        if (!searchFailed && !albumFailed) {
+          this.remember(this.trackCache, cacheKey, { track: match, expires: Date.now() + SEARCH_TTL_MS });
+        }
         return match;
       }
       /** Returns the cached track for a Saavn song id, or null. */
@@ -562,9 +593,6 @@ var init_jioSaavnService = __esm({
         const task = this.requestAlbumTracks(albumName).then((tracks) => {
           this.remember(this.albumCache, key, { tracks, expires: Date.now() + SEARCH_TTL_MS });
           return tracks;
-        }).catch((err) => {
-          console.info("[JioSaavn] album lookup unavailable:", err?.message || String(err));
-          return [];
         }).finally(() => {
           this.inflightAlbums.delete(key);
         });
@@ -625,9 +653,6 @@ var init_jioSaavnService = __esm({
         const task = this.requestSearch(query).then((tracks) => {
           this.remember(this.searchCache, key, { tracks, expires: Date.now() + SEARCH_TTL_MS });
           return tracks;
-        }).catch((err) => {
-          console.info("[JioSaavn] search unavailable:", err?.message || String(err));
-          return [];
         }).finally(() => {
           this.inflightSearches.delete(key);
         });
