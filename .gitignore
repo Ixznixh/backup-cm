@@ -6,4 +6,3 @@ dist/
 *.log
 .env*
 !.env.example
-api/index.js
