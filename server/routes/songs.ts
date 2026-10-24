@@ -15,6 +15,7 @@ export async function handleAudioStreamProxy(req: Request, res: Response) {
   let queryArtist = String(req.query.artist || '').trim();
   let queryAlbum = String(req.query.album || '').trim();
   let queryDuration = parseInt(String(req.query.duration || '0'), 10) || undefined;
+  const queryQuality = String(req.query.quality || '').trim();
 
   if (!id && !queryTitle) {
     const fallbackBuffer = generateMusicalWavBuffer(12);
@@ -56,6 +57,7 @@ export async function handleAudioStreamProxy(req: Request, res: Response) {
       artist: queryArtist,
       album: queryAlbum,
       duration: queryDuration,
+      quality: queryQuality,
     });
 
     // Direct-playable CDN source (JioSaavn): hand the URL straight to the client.
@@ -229,7 +231,9 @@ songsRouter.get('/:id/lyrics', async (req: Request, res: Response) => {
 songsRouter.get('/:id/stream', async (req: Request, res: Response) => {
   const { id } = req.params;
   try {
-    const stream = await youtubeMusicService.getStream(id);
+    const stream = await youtubeMusicService.getStream(id, {
+      quality: String(req.query.quality || '').trim(),
+    });
     res.json(stream);
   } catch (err: any) {
     res.status(503).json({ error: 'Playback stream unavailable' });
@@ -243,6 +247,7 @@ songsRouter.get('/resolve', async (req: Request, res: Response) => {
   const queryAlbum = String(req.query.album || '').trim();
   const queryDuration = parseInt(String(req.query.duration || '0'), 10) || undefined;
   const id = String(req.query.id || '').replace(/^(yt_liked_|yt_top_|yt_sync_)/, '').trim();
+  const quality = String(req.query.quality || '').trim();
 
   let title = queryTitle;
   let artist = queryArtist;
@@ -264,7 +269,13 @@ songsRouter.get('/resolve', async (req: Request, res: Response) => {
   // Resolve the real stream for this track. When it is a CDN URL the client can play
   // directly, hand it over so playback needs no further server round trip.
   try {
-    const stream = await youtubeMusicService.getStream(id, { title, artist, album, duration });
+    const stream = await youtubeMusicService.getStream(id, {
+      title,
+      artist,
+      album,
+      duration,
+      quality: String(req.query.quality || '').trim(),
+    });
     if (stream?.available && stream.streamUrl) {
       return res.json({
         success: true,
@@ -340,9 +351,10 @@ songsRouter.post('/prepare', async (req: Request, res: Response) => {
       const artist = String(track.artist || '').trim();
       const album = String(track.album || '').trim();
       const duration = parseInt(String(track.duration || '0'), 10) || undefined;
+      const quality = String(req.body?.quality || '').trim();
 
       try {
-        const stream = await youtubeMusicService.getStream(id, { title, artist, album, duration });
+        const stream = await youtubeMusicService.getStream(id, { title, artist, album, duration, quality });
         if (stream?.available && stream.streamUrl && isDirectPlayableCdnUrl(stream.streamUrl)) {
           return { id, streamUrl: stream.streamUrl, duration: stream.duration };
         }
@@ -362,6 +374,7 @@ songsRouter.get('/:id/prewarm', async (req: Request, res: Response) => {
   const title = String(req.query.title || '').trim();
   const artist = String(req.query.artist || '').trim();
   const album = String(req.query.album || '').trim();
+  const quality = String(req.query.quality || '').trim();
   const durationHint = parseInt(String(req.query.duration || '0'), 10) || undefined;
 
   // Prewarm awaits the real resolution (it runs ~30s before the track ends), so the next
@@ -375,6 +388,7 @@ songsRouter.get('/:id/prewarm', async (req: Request, res: Response) => {
         artist,
         album,
         duration: durationHint,
+        quality,
       });
       if (stream?.available && typeof stream.streamUrl === 'string') {
         resolvedUrl = stream.streamUrl;

@@ -720,7 +720,9 @@ export class AudioPlayer {
       song.title || ''
     )}&artist=${encodeURIComponent(song.artist || '')}&album=${encodeURIComponent(
       song.album || ''
-    )}&duration=${Math.round(Number(song.duration) || 0)}`;
+    )}&duration=${Math.round(Number(song.duration) || 0)}&quality=${encodeURIComponent(
+      this.currentQuality || 'high'
+    )}`;
 
     return bustCache ? `${proxyUrl}&_r=${Date.now()}` : proxyUrl;
   }
@@ -974,7 +976,9 @@ export class AudioPlayer {
           song.title
         )}&artist=${encodeURIComponent(song.artist || '')}&album=${encodeURIComponent(
           song.album || ''
-        )}&duration=${Math.round(Number(song.duration) || 0)}`
+        )}&duration=${Math.round(Number(song.duration) || 0)}&quality=${encodeURIComponent(
+          this.currentQuality || 'high'
+        )}`
       )
         .then((res) => res.json())
         .then((data) => {
@@ -1043,6 +1047,7 @@ export class AudioPlayer {
     pending.forEach((track) => this.preparingTrackIds.add(this.cleanStreamId(track.id)));
 
     const payload = {
+      quality: this.currentQuality || 'high',
       tracks: pending.map((track) => ({
         id: this.cleanStreamId(track.id),
         title: track.title || '',
@@ -1211,7 +1216,9 @@ export class AudioPlayer {
           nextTrack.title || ''
         )}&artist=${encodeURIComponent(nextTrack.artist || '')}&album=${encodeURIComponent(
           nextTrack.album || ''
-        )}&duration=${Math.round(Number(nextTrack.duration) || 0)}`
+        )}&duration=${Math.round(Number(nextTrack.duration) || 0)}&quality=${encodeURIComponent(
+          this.currentQuality || 'high'
+        )}`
       )
         .then((res) => res.json())
         .then((data) => {
@@ -1234,7 +1241,9 @@ export class AudioPlayer {
               secondTrack.title || ''
             )}&artist=${encodeURIComponent(secondTrack.artist || '')}&album=${encodeURIComponent(
               secondTrack.album || ''
-            )}&duration=${Math.round(Number(secondTrack.duration) || 0)}`
+            )}&duration=${Math.round(Number(secondTrack.duration) || 0)}&quality=${encodeURIComponent(
+              this.currentQuality || 'high'
+            )}`
           )
             .then((res) => res.json())
             .then((data) => {

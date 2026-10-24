@@ -9,7 +9,7 @@ import { Innertube, Parser, Log } from 'youtubei.js';
 import { Song, Album, Artist, Playlist, SearchResults, HomeSection, Lyrics, StreamInfo } from '../types/music';
 import { getPalette, parseDuration, getBestThumbnail, getText } from '../utils/formatters';
 import { getGeminiThanglishSyncedLyrics, convertLinesToThanglish, transliterateTamilToThanglish } from './geminiLyrics';
-import { jioSaavnService } from './jioSaavnService';
+import { jioSaavnService, isDirectPlayableCdnUrl, normalizeForMatch } from './jioSaavnService';
 
 // Set Innertube logging level to NONE to completely eliminate benign parser warnings on YouTube's changing UI schemas
 Log.setLevel(Log.Level.NONE);
@@ -40,6 +40,71 @@ export function isPlayableSongEntry(
 
   return true;
 }
+
+/**
+ * Resolves the app's quality setting to the rendition the CDN actually serves.
+ *
+ * The catalogue publishes 96/160/320 kbps renditions of the same track as a filename suffix,
+ * so "Standard • 160k" is a real bitrate switch, not a label. The stream cache holds the
+ * 320 kbps URL; this rewrites it for the request that asked for something else.
+ */
+export function applyAudioQuality(stream: StreamInfo, quality?: string): StreamInfo {
+  if (!stream?.streamUrl || !isDirectPlayableCdnUrl(stream.streamUrl)) return stream;
+
+  const wantedKbps = String(quality || '').toLowerCase() === 'normal' ? 160 : 320;
+  const rewritten = stream.streamUrl.replace(/_\d+(\.mp4)(?=\?|$)/, `_${wantedKbps}$1`);
+  if (rewritten === stream.streamUrl) return stream;
+
+  return { ...stream, streamUrl: rewritten, bitrate: wantedKbps * 1000 };
+}
+
+/**
+ * How likely a lyric provider's hit is the same recording as the requested track.
+ *
+ * Providers answer by similarity search, so the first result is frequently a cover, a live
+ * version or a similarly named song. Lyrics for the wrong track look like a broken player, so
+ * every non-exact provider answer is scored before it is used.
+ */
+export function scoreLyricsMatch(
+  candidate: { title?: string; artist?: string; duration?: number },
+  target: { title?: string; artist?: string; duration?: number }
+): number {
+  const targetTitle = normalizeForMatch(target.title);
+  const candidateTitle = normalizeForMatch(candidate.title);
+
+  let titleScore = 0;
+  if (targetTitle && candidateTitle) {
+    if (candidateTitle === targetTitle) titleScore = 1;
+    else if (candidateTitle.includes(targetTitle) || targetTitle.includes(candidateTitle)) {
+      titleScore = 0.9;
+    } else {
+      const targetTokens = targetTitle.split(' ');
+      const candidateTokens = new Set(candidateTitle.split(' '));
+      const shared = targetTokens.filter((token) => candidateTokens.has(token)).length;
+      titleScore = targetTokens.length ? shared / targetTokens.length : 0;
+    }
+  }
+
+  const targetArtist = normalizeForMatch(target.artist).split(' ')[0];
+  const candidateArtist = normalizeForMatch(candidate.artist);
+  const artistScore = targetArtist && candidateArtist.includes(targetArtist) ? 1 : 0;
+
+  let durationScore = 0.5;
+  if (target.duration && candidate.duration) {
+    const delta = Math.abs(candidate.duration - target.duration);
+    durationScore = delta <= 6 ? 1 : delta <= 15 ? 0.5 : 0;
+  }
+
+  const score = 0.6 * titleScore + 0.15 * artistScore + 0.25 * durationScore;
+
+  // A matching title with no agreeing artist and no agreeing length is a different recording
+  // (a cover of a common title), so cap it below any usable threshold rather than pass it on.
+  if (artistScore === 0 && durationScore === 0) return Math.min(score, 0.5);
+  return score;
+}
+
+/** Minimum score for a provider answer to be believed; see {@link scoreLyricsMatch}. */
+const LYRICS_MATCH_THRESHOLD = 0.62;
 
 // Register runtime node handlers for YouTube interstitial/ad nodes to avoid missing class warnings
 class PlayerInterstitialNode {
@@ -565,36 +630,58 @@ class YouTubeMusicService {
     const albums: Album[] = [];
     const playlists: Playlist[] = [];
 
-    // Helper to process shelf or list items
-    const processItems = (rawList: any[], isTopResultShelf = false) => {
-      let indexCounter = 0;
-      for (const item of rawList) {
-        if (!item) continue;
-        const itemType = item.item_type || item.type;
+    // --- YouTube Music-only result mapping -----------------------------------------
+    // YouTube Music returns canonical rows: the song title, the credited artists, the album
+    // and a proper track thumbnail. Plain YouTube search returns video headings instead
+    // ("| RAAYAN | Dhanush | …"), which is why titles, credits and artwork were wrong.
+    type ResultKind = 'song' | 'artist' | 'album' | 'playlist';
 
-        if (itemType === 'song' || itemType === 'video' || item.duration || item.videoId || item.video_id || item.content_type === 'VIDEO') {
-          const s = this.normalizeSong(item) as any;
-          s._originalIndex = indexCounter++;
-          if (isTopResultShelf && indexCounter === 1) {
-            s._isTopResult = true;
-          }
-          songs.push(s);
-        } else if (itemType === 'artist' || itemType === 'channel' || item.content_type === 'CHANNEL') {
-          artists.push(this.normalizeArtist(item));
-        } else if (itemType === 'album') {
-          albums.push(this.normalizeAlbum(item));
-        } else if (itemType === 'playlist' || item.content_type === 'PLAYLIST') {
-          playlists.push(this.normalizePlaylist(item));
-        } else {
-          // Check title / endpoint
-          if (item.content_id || (item.id && item.duration)) {
-            const s = this.normalizeSong(item) as any;
-            s._originalIndex = indexCounter++;
-            if (isTopResultShelf && indexCounter === 1) {
-              s._isTopResult = true;
-            }
-            songs.push(s);
-          }
+    const pushSong = (item: any) => {
+      const song = this.normalizeSong(item) as any;
+      song._originalIndex = songs.length;
+      songs.push(song);
+    };
+
+    const pushResult = (kind: ResultKind, item: any) => {
+      if (!item) return;
+      if (kind === 'song') pushSong(item);
+      else if (kind === 'album') albums.push(this.normalizeAlbum(item));
+      else if (kind === 'artist') artists.push(this.normalizeArtist(item));
+      else playlists.push(this.normalizePlaylist(item));
+    };
+
+    // Untyped searches return shelves labelled "Songs", "Albums", "Artists", …
+    const shelfKind = (shelf: any): ResultKind | null => {
+      const title = String(shelf?.title ?? '').toLowerCase();
+      if (title.includes('song') || title.includes('video')) return 'song';
+      if (title.includes('album')) return 'album';
+      if (title.includes('artist')) return 'artist';
+      if (title.includes('playlist')) return 'playlist';
+      return null;
+    };
+
+    // Typed searches label the shelf reliably, but the top-result card arrives as an
+    // ItemSection with no title, so fall back to the row's own shape.
+    const itemKind = (item: any): ResultKind | null => {
+      const id = String(item?.id || '');
+      const type = String(item?.type || '').toLowerCase();
+      if (type.includes('album') || id.startsWith('MPRE')) return 'album';
+      if (type.includes('two') || type.includes('artist') || type.includes('playlist')) {
+        if (id.startsWith('UC')) return 'artist';
+        return id.startsWith('MP') ? 'playlist' : null;
+      }
+      if (id.startsWith('UC') && id.length > 20) return 'artist';
+      if (id.startsWith('MP') && id.length > 20) return 'playlist';
+      if (item?.duration || type.includes('responsive')) return 'song';
+      return null;
+    };
+
+    const collectMusicResults = (res: any, forced?: ResultKind) => {
+      for (const shelf of res?.contents || []) {
+        const hint = forced || shelfKind(shelf);
+        for (const item of shelf.contents || []) {
+          const kind = hint || itemKind(item);
+          if (kind) pushResult(kind, item);
         }
       }
     };
@@ -603,87 +690,35 @@ class YouTubeMusicService {
       Promise.race([p.catch(() => null), new Promise((resolve) => setTimeout(() => resolve(null), ms))]);
 
     if (filter === 'song' || filter === 'songs' || filter === 'video' || filter === 'videos') {
-      const [ytVideos, ytmSongs]: [any, any] = await Promise.all([
-        timeoutHelper(yt.search(trimmed, { type: 'video' }), 12000),
-        timeoutHelper(yt.music.search(trimmed, { type: 'song' }), 8000),
-      ]);
-      if (ytVideos) {
-        processItems(ytVideos.videos || ytVideos.results || []);
-      }
-      if (ytmSongs) {
-        for (const shelf of ytmSongs.contents || []) {
-          processItems(shelf.contents || []);
-        }
-      }
+      const ytmSongs = await timeoutHelper(yt.music.search(trimmed, { type: 'song' }), 12000);
+      collectMusicResults(ytmSongs, 'song');
     } else if (filter === 'artist' || filter === 'artists' || filter === 'channel' || filter === 'channels') {
-      const [ytChannels, ytmArtists]: [any, any] = await Promise.all([
-        timeoutHelper(yt.search(trimmed, { type: 'channel' }), 10000),
-        timeoutHelper(yt.music.search(trimmed, { type: 'artist' }), 8000),
-      ]);
-      if (ytChannels) {
-        processItems(ytChannels.channels || ytChannels.results || []);
-      }
-      if (ytmArtists) {
-        for (const shelf of ytmArtists.contents || []) {
-          processItems(shelf.contents || []);
-        }
-      }
+      const ytmArtists = await timeoutHelper(yt.music.search(trimmed, { type: 'artist' }), 12000);
+      collectMusicResults(ytmArtists, 'artist');
     } else if (filter === 'playlist' || filter === 'playlists') {
-      const [ytPlaylists, ytmPlaylists]: [any, any] = await Promise.all([
-        timeoutHelper(yt.search(trimmed, { type: 'playlist' }), 10000),
-        timeoutHelper(yt.music.search(trimmed, { type: 'playlist' }), 8000),
-      ]);
-      if (ytPlaylists) {
-        processItems(ytPlaylists.playlists || ytPlaylists.results || []);
-      }
-      if (ytmPlaylists) {
-        for (const shelf of ytmPlaylists.contents || []) {
-          processItems(shelf.contents || []);
-        }
-      }
+      const ytmPlaylists = await timeoutHelper(yt.music.search(trimmed, { type: 'playlist' }), 12000);
+      collectMusicResults(ytmPlaylists, 'playlist');
     } else if (filter === 'album' || filter === 'albums') {
-      const ytmAlbums: any = await timeoutHelper(yt.music.search(trimmed, { type: 'album' }), 10000);
-      if (ytmAlbums) {
-        for (const shelf of ytmAlbums.contents || []) {
-          processItems(shelf.contents || []);
-        }
-      }
+      const ytmAlbums = await timeoutHelper(yt.music.search(trimmed, { type: 'album' }), 12000);
+      collectMusicResults(ytmAlbums, 'album');
     } else {
-      // General pure YouTube multi-search across videos, channels, playlists, and music releases
+      // General search: four typed YouTube Music queries in parallel. Each returns a
+      // canonical shelf (Songs / Albums / Artists / Community playlists), so nothing needs
+      // guessing from row shape — and no plain-YouTube video headings enter the results.
       try {
-        const [ytVideos, ytPlaylists, ytChannels, ytmGen, ytmAlbums]: [any, any, any, any, any] = await Promise.all([
-          timeoutHelper(yt.search(trimmed, { type: 'video' }), 12000),
-          timeoutHelper(yt.search(trimmed, { type: 'playlist' }), 10000),
-          timeoutHelper(yt.search(trimmed, { type: 'channel' }), 10000),
-          timeoutHelper(yt.music.search(trimmed), 10000),
-          timeoutHelper(yt.music.search(trimmed, { type: 'album' }), 8000),
+        const [ytmSongs, ytmAlbums, ytmArtists, ytmPlaylists] = await Promise.all([
+          timeoutHelper(yt.music.search(trimmed, { type: 'song' }), 12000),
+          timeoutHelper(yt.music.search(trimmed, { type: 'album' }), 12000),
+          timeoutHelper(yt.music.search(trimmed, { type: 'artist' }), 12000),
+          timeoutHelper(yt.music.search(trimmed, { type: 'playlist' }), 12000),
         ]);
 
-        if (ytVideos) {
-          processItems(ytVideos.videos || ytVideos.results || [], true);
-        }
-
-        if (ytPlaylists) {
-          processItems(ytPlaylists.playlists || ytPlaylists.results || []);
-        }
-
-        if (ytChannels) {
-          processItems(ytChannels.channels || ytChannels.results || []);
-        }
-
-        if (ytmGen) {
-          for (const shelf of ytmGen.contents || []) {
-            processItems(shelf.contents || []);
-          }
-        }
-
-        if (ytmAlbums) {
-          for (const shelf of ytmAlbums.contents || []) {
-            processItems(shelf.contents || []);
-          }
-        }
+        collectMusicResults(ytmSongs, 'song');
+        collectMusicResults(ytmAlbums, 'album');
+        collectMusicResults(ytmArtists, 'artist');
+        collectMusicResults(ytmPlaylists, 'playlist');
       } catch (err: any) {
-        console.warn('Pure YouTube general search fallback:', err.message);
+        console.warn('YouTube Music search fallback:', err.message);
       }
     }
 
@@ -1521,9 +1556,30 @@ class YouTubeMusicService {
             let target: any = null;
 
             if (Array.isArray(rawData)) {
-              target = rawData.find((x: any) => x.syncedLyrics) || rawData.find((x: any) => x.plainLyrics) || rawData[0];
+              const acceptable = (rawData as any[])
+                .filter((x: any) => x && (x.syncedLyrics || x.plainLyrics))
+                .map((x: any) => ({
+                  candidate: x,
+                  score: scoreLyricsMatch(
+                    { title: x.trackName, artist: x.artistName, duration: x.duration },
+                    { title: songTitle, artist: songArtist, duration: songDuration }
+                  ),
+                }))
+                .filter((entry) => entry.score >= LYRICS_MATCH_THRESHOLD)
+                .sort((a, b) => b.score - a.score);
+
+              // Among equally good matches prefer the one that is time-synced; if nothing
+              // scores well the provider found a different song, so keep looking.
+              const synced = acceptable.find((entry) => entry.candidate.syncedLyrics);
+              target = (synced || acceptable[0])?.candidate || null;
             } else if (rawData && (rawData.syncedLyrics || rawData.plainLyrics)) {
-              target = rawData;
+              target =
+                scoreLyricsMatch(
+                  { title: rawData.trackName, artist: rawData.artistName, duration: rawData.duration },
+                  { title: songTitle, artist: songArtist, duration: songDuration }
+                ) >= LYRICS_MATCH_THRESHOLD
+                  ? rawData
+                  : null;
             }
 
             if (target) {
@@ -1573,7 +1629,22 @@ class YouTubeMusicService {
 
         if (sRes && sRes.ok) {
           const sData = await sRes.json().catch(() => null);
-          const firstSongId = sData?.result?.songs?.[0]?.id;
+          const matches: any[] = Array.isArray(sData?.result?.songs) ? sData.result.songs : [];
+          const scored = matches
+            .map((song) => ({
+              song,
+              score: scoreLyricsMatch(
+                {
+                  title: song.name,
+                  artist: (song.artists || []).map((a: any) => a.name).join(', '),
+                  duration: song.duration ? Math.round(song.duration / 1000) : undefined,
+                },
+                { title: songTitle, artist: songArtist, duration: songDuration }
+              ),
+            }))
+            .filter((entry) => entry.score >= LYRICS_MATCH_THRESHOLD)
+            .sort((a, b) => b.score - a.score);
+          const firstSongId = scored[0]?.song?.id;
           if (firstSongId) {
             const lyricUrl = `https://music.163.com/api/song/lyric?os=pc&id=${firstSongId}&lv=-1&kv=-1&tv=-1`;
             const lRes = await fetch(lyricUrl, {
@@ -1757,7 +1828,14 @@ class YouTubeMusicService {
    */
   public async getStream(
     id: string,
-    metadata?: { title?: string; artist?: string; album?: string; duration?: number }
+    metadata?: {
+      title?: string;
+      artist?: string;
+      album?: string;
+      duration?: number;
+      /** App quality setting: 'normal' plays 160 kbps, everything else plays the 320 kbps rendition. */
+      quality?: string;
+    }
   ): Promise<StreamInfo> {
     if (!id || typeof id !== 'string' || id.trim().length === 0) {
       return {
@@ -1779,10 +1857,11 @@ class YouTubeMusicService {
       };
     }
 
-    // Check high-speed stream cache
+    // Check high-speed stream cache. The cache always holds the canonical 320 kbps URL; the
+    // requested rendition is applied on the way out so quality changes take effect at once.
     const cached = this.streamCache.get(cleanId);
     if (cached && cached.expires > Date.now()) {
-      return cached.data;
+      return applyAudioQuality(cached.data, metadata?.quality);
     }
 
     // 1. Primary: JioSaavn 320 kbps AAC.
@@ -1813,7 +1892,7 @@ class YouTubeMusicService {
             duration: saavn.duration || cachedSong?.duration,
           };
           this.streamCache.set(cleanId, { data: saavnStream, expires: Date.now() + 6 * 3600 * 1000 });
-          return saavnStream;
+          return applyAudioQuality(saavnStream, metadata?.quality);
         }
       } catch (err: any) {
         console.warn('[getStream] JioSaavn match notice:', err?.message || err);

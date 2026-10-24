@@ -36,6 +36,9 @@ function parseDuration(duration) {
 function getBestThumbnail(thumbnails, fallback = "https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=800&q=80") {
   if (!thumbnails) return fallback;
   let url = "";
+  if (typeof thumbnails === "object" && Array.isArray(thumbnails.contents)) {
+    thumbnails = thumbnails.contents;
+  }
   if (Array.isArray(thumbnails) && thumbnails.length > 0) {
     const sorted = [...thumbnails].sort((a, b) => (b.width || 0) - (a.width || 0));
     url = sorted[0]?.url || "";
@@ -720,6 +723,40 @@ function isPlayableSongEntry(song) {
   if (/\b(music|songs|tv)\s*$/i.test(String(song.artist || "").trim())) return false;
   return true;
 }
+function applyAudioQuality(stream, quality) {
+  if (!stream?.streamUrl || !isDirectPlayableCdnUrl(stream.streamUrl)) return stream;
+  const wantedKbps = String(quality || "").toLowerCase() === "normal" ? 160 : 320;
+  const rewritten = stream.streamUrl.replace(/_\d+(\.mp4)(?=\?|$)/, `_${wantedKbps}$1`);
+  if (rewritten === stream.streamUrl) return stream;
+  return { ...stream, streamUrl: rewritten, bitrate: wantedKbps * 1e3 };
+}
+function scoreLyricsMatch(candidate, target) {
+  const targetTitle = normalizeForMatch(target.title);
+  const candidateTitle = normalizeForMatch(candidate.title);
+  let titleScore = 0;
+  if (targetTitle && candidateTitle) {
+    if (candidateTitle === targetTitle) titleScore = 1;
+    else if (candidateTitle.includes(targetTitle) || targetTitle.includes(candidateTitle)) {
+      titleScore = 0.9;
+    } else {
+      const targetTokens = targetTitle.split(" ");
+      const candidateTokens = new Set(candidateTitle.split(" "));
+      const shared = targetTokens.filter((token) => candidateTokens.has(token)).length;
+      titleScore = targetTokens.length ? shared / targetTokens.length : 0;
+    }
+  }
+  const targetArtist = normalizeForMatch(target.artist).split(" ")[0];
+  const candidateArtist = normalizeForMatch(candidate.artist);
+  const artistScore = targetArtist && candidateArtist.includes(targetArtist) ? 1 : 0;
+  let durationScore = 0.5;
+  if (target.duration && candidate.duration) {
+    const delta = Math.abs(candidate.duration - target.duration);
+    durationScore = delta <= 6 ? 1 : delta <= 15 ? 0.5 : 0;
+  }
+  const score = 0.6 * titleScore + 0.15 * artistScore + 0.25 * durationScore;
+  if (artistScore === 0 && durationScore === 0) return Math.min(score, 0.5);
+  return score;
+}
 function normalizeTitleTokens(title) {
   if (!title) return [];
   return title.toLowerCase().replace(/\[[^\]]*\]/g, "").replace(/\([^)]*\)/g, "").replace(/\b(official|video|audio|lyric|lyrics|full|song|remix|lofi|hd|4k|mv|remastered|version|visualizer)\b/gi, "").replace(/[^a-z0-9\s]/gi, "").trim().split(/\s+/).filter((w) => w.length > 1);
@@ -927,7 +964,7 @@ function isTitleTooSimilar(titleA, titleB) {
   const simB = overlap / tokensB.length;
   return simA >= 0.5 || simB >= 0.5;
 }
-var MAX_SONG_DURATION_SECONDS, PlayerInterstitialNode, InterstitialViewNode, QUICK_PICKS_QUERY_POOL, YouTubeMusicService, youtubeMusicService;
+var MAX_SONG_DURATION_SECONDS, LYRICS_MATCH_THRESHOLD, PlayerInterstitialNode, InterstitialViewNode, QUICK_PICKS_QUERY_POOL, YouTubeMusicService, youtubeMusicService;
 var init_youtubeMusic = __esm({
   "server/services/youtubeMusic.ts"() {
     init_formatters();
@@ -935,6 +972,7 @@ var init_youtubeMusic = __esm({
     init_jioSaavnService();
     Log.setLevel(Log.Level.NONE);
     MAX_SONG_DURATION_SECONDS = 15 * 60;
+    LYRICS_MATCH_THRESHOLD = 0.62;
     PlayerInterstitialNode = class {
       static {
         this.type = "PlayerInterstitial";
@@ -1166,113 +1204,75 @@ var init_youtubeMusic = __esm({
         const artists = [];
         const albums = [];
         const playlists = [];
-        const processItems = (rawList, isTopResultShelf = false) => {
-          let indexCounter = 0;
-          for (const item of rawList) {
-            if (!item) continue;
-            const itemType = item.item_type || item.type;
-            if (itemType === "song" || itemType === "video" || item.duration || item.videoId || item.video_id || item.content_type === "VIDEO") {
-              const s = this.normalizeSong(item);
-              s._originalIndex = indexCounter++;
-              if (isTopResultShelf && indexCounter === 1) {
-                s._isTopResult = true;
-              }
-              songs.push(s);
-            } else if (itemType === "artist" || itemType === "channel" || item.content_type === "CHANNEL") {
-              artists.push(this.normalizeArtist(item));
-            } else if (itemType === "album") {
-              albums.push(this.normalizeAlbum(item));
-            } else if (itemType === "playlist" || item.content_type === "PLAYLIST") {
-              playlists.push(this.normalizePlaylist(item));
-            } else {
-              if (item.content_id || item.id && item.duration) {
-                const s = this.normalizeSong(item);
-                s._originalIndex = indexCounter++;
-                if (isTopResultShelf && indexCounter === 1) {
-                  s._isTopResult = true;
-                }
-                songs.push(s);
-              }
+        const pushSong = (item) => {
+          const song = this.normalizeSong(item);
+          song._originalIndex = songs.length;
+          songs.push(song);
+        };
+        const pushResult = (kind, item) => {
+          if (!item) return;
+          if (kind === "song") pushSong(item);
+          else if (kind === "album") albums.push(this.normalizeAlbum(item));
+          else if (kind === "artist") artists.push(this.normalizeArtist(item));
+          else playlists.push(this.normalizePlaylist(item));
+        };
+        const shelfKind = (shelf) => {
+          const title = String(shelf?.title ?? "").toLowerCase();
+          if (title.includes("song") || title.includes("video")) return "song";
+          if (title.includes("album")) return "album";
+          if (title.includes("artist")) return "artist";
+          if (title.includes("playlist")) return "playlist";
+          return null;
+        };
+        const itemKind = (item) => {
+          const id = String(item?.id || "");
+          const type = String(item?.type || "").toLowerCase();
+          if (type.includes("album") || id.startsWith("MPRE")) return "album";
+          if (type.includes("two") || type.includes("artist") || type.includes("playlist")) {
+            if (id.startsWith("UC")) return "artist";
+            return id.startsWith("MP") ? "playlist" : null;
+          }
+          if (id.startsWith("UC") && id.length > 20) return "artist";
+          if (id.startsWith("MP") && id.length > 20) return "playlist";
+          if (item?.duration || type.includes("responsive")) return "song";
+          return null;
+        };
+        const collectMusicResults = (res, forced) => {
+          for (const shelf of res?.contents || []) {
+            const hint = forced || shelfKind(shelf);
+            for (const item of shelf.contents || []) {
+              const kind = hint || itemKind(item);
+              if (kind) pushResult(kind, item);
             }
           }
         };
         const timeoutHelper = (p, ms) => Promise.race([p.catch(() => null), new Promise((resolve) => setTimeout(() => resolve(null), ms))]);
         if (filter === "song" || filter === "songs" || filter === "video" || filter === "videos") {
-          const [ytVideos, ytmSongs] = await Promise.all([
-            timeoutHelper(yt.search(trimmed, { type: "video" }), 12e3),
-            timeoutHelper(yt.music.search(trimmed, { type: "song" }), 8e3)
-          ]);
-          if (ytVideos) {
-            processItems(ytVideos.videos || ytVideos.results || []);
-          }
-          if (ytmSongs) {
-            for (const shelf of ytmSongs.contents || []) {
-              processItems(shelf.contents || []);
-            }
-          }
+          const ytmSongs = await timeoutHelper(yt.music.search(trimmed, { type: "song" }), 12e3);
+          collectMusicResults(ytmSongs, "song");
         } else if (filter === "artist" || filter === "artists" || filter === "channel" || filter === "channels") {
-          const [ytChannels, ytmArtists] = await Promise.all([
-            timeoutHelper(yt.search(trimmed, { type: "channel" }), 1e4),
-            timeoutHelper(yt.music.search(trimmed, { type: "artist" }), 8e3)
-          ]);
-          if (ytChannels) {
-            processItems(ytChannels.channels || ytChannels.results || []);
-          }
-          if (ytmArtists) {
-            for (const shelf of ytmArtists.contents || []) {
-              processItems(shelf.contents || []);
-            }
-          }
+          const ytmArtists = await timeoutHelper(yt.music.search(trimmed, { type: "artist" }), 12e3);
+          collectMusicResults(ytmArtists, "artist");
         } else if (filter === "playlist" || filter === "playlists") {
-          const [ytPlaylists, ytmPlaylists] = await Promise.all([
-            timeoutHelper(yt.search(trimmed, { type: "playlist" }), 1e4),
-            timeoutHelper(yt.music.search(trimmed, { type: "playlist" }), 8e3)
-          ]);
-          if (ytPlaylists) {
-            processItems(ytPlaylists.playlists || ytPlaylists.results || []);
-          }
-          if (ytmPlaylists) {
-            for (const shelf of ytmPlaylists.contents || []) {
-              processItems(shelf.contents || []);
-            }
-          }
+          const ytmPlaylists = await timeoutHelper(yt.music.search(trimmed, { type: "playlist" }), 12e3);
+          collectMusicResults(ytmPlaylists, "playlist");
         } else if (filter === "album" || filter === "albums") {
-          const ytmAlbums = await timeoutHelper(yt.music.search(trimmed, { type: "album" }), 1e4);
-          if (ytmAlbums) {
-            for (const shelf of ytmAlbums.contents || []) {
-              processItems(shelf.contents || []);
-            }
-          }
+          const ytmAlbums = await timeoutHelper(yt.music.search(trimmed, { type: "album" }), 12e3);
+          collectMusicResults(ytmAlbums, "album");
         } else {
           try {
-            const [ytVideos, ytPlaylists, ytChannels, ytmGen, ytmAlbums] = await Promise.all([
-              timeoutHelper(yt.search(trimmed, { type: "video" }), 12e3),
-              timeoutHelper(yt.search(trimmed, { type: "playlist" }), 1e4),
-              timeoutHelper(yt.search(trimmed, { type: "channel" }), 1e4),
-              timeoutHelper(yt.music.search(trimmed), 1e4),
-              timeoutHelper(yt.music.search(trimmed, { type: "album" }), 8e3)
+            const [ytmSongs, ytmAlbums, ytmArtists, ytmPlaylists] = await Promise.all([
+              timeoutHelper(yt.music.search(trimmed, { type: "song" }), 12e3),
+              timeoutHelper(yt.music.search(trimmed, { type: "album" }), 12e3),
+              timeoutHelper(yt.music.search(trimmed, { type: "artist" }), 12e3),
+              timeoutHelper(yt.music.search(trimmed, { type: "playlist" }), 12e3)
             ]);
-            if (ytVideos) {
-              processItems(ytVideos.videos || ytVideos.results || [], true);
-            }
-            if (ytPlaylists) {
-              processItems(ytPlaylists.playlists || ytPlaylists.results || []);
-            }
-            if (ytChannels) {
-              processItems(ytChannels.channels || ytChannels.results || []);
-            }
-            if (ytmGen) {
-              for (const shelf of ytmGen.contents || []) {
-                processItems(shelf.contents || []);
-              }
-            }
-            if (ytmAlbums) {
-              for (const shelf of ytmAlbums.contents || []) {
-                processItems(shelf.contents || []);
-              }
-            }
+            collectMusicResults(ytmSongs, "song");
+            collectMusicResults(ytmAlbums, "album");
+            collectMusicResults(ytmArtists, "artist");
+            collectMusicResults(ytmPlaylists, "playlist");
           } catch (err) {
-            console.warn("Pure YouTube general search fallback:", err.message);
+            console.warn("YouTube Music search fallback:", err.message);
           }
         }
         const cleanSongs = songs.filter((s) => !isJunkOrSpamTrack(s.title, s.artist, trimmed));
@@ -1985,9 +1985,20 @@ var init_youtubeMusic = __esm({
                 const rawData = await lrcRes.json().catch(() => null);
                 let target = null;
                 if (Array.isArray(rawData)) {
-                  target = rawData.find((x) => x.syncedLyrics) || rawData.find((x) => x.plainLyrics) || rawData[0];
+                  const acceptable = rawData.filter((x) => x && (x.syncedLyrics || x.plainLyrics)).map((x) => ({
+                    candidate: x,
+                    score: scoreLyricsMatch(
+                      { title: x.trackName, artist: x.artistName, duration: x.duration },
+                      { title: songTitle, artist: songArtist, duration: songDuration }
+                    )
+                  })).filter((entry) => entry.score >= LYRICS_MATCH_THRESHOLD).sort((a, b) => b.score - a.score);
+                  const synced = acceptable.find((entry) => entry.candidate.syncedLyrics);
+                  target = (synced || acceptable[0])?.candidate || null;
                 } else if (rawData && (rawData.syncedLyrics || rawData.plainLyrics)) {
-                  target = rawData;
+                  target = scoreLyricsMatch(
+                    { title: rawData.trackName, artist: rawData.artistName, duration: rawData.duration },
+                    { title: songTitle, artist: songArtist, duration: songDuration }
+                  ) >= LYRICS_MATCH_THRESHOLD ? rawData : null;
                 }
                 if (target) {
                   if (target.syncedLyrics) {
@@ -2028,7 +2039,19 @@ var init_youtubeMusic = __esm({
             clearTimeout(timeout);
             if (sRes && sRes.ok) {
               const sData = await sRes.json().catch(() => null);
-              const firstSongId = sData?.result?.songs?.[0]?.id;
+              const matches = Array.isArray(sData?.result?.songs) ? sData.result.songs : [];
+              const scored = matches.map((song) => ({
+                song,
+                score: scoreLyricsMatch(
+                  {
+                    title: song.name,
+                    artist: (song.artists || []).map((a) => a.name).join(", "),
+                    duration: song.duration ? Math.round(song.duration / 1e3) : void 0
+                  },
+                  { title: songTitle, artist: songArtist, duration: songDuration }
+                )
+              })).filter((entry) => entry.score >= LYRICS_MATCH_THRESHOLD).sort((a, b) => b.score - a.score);
+              const firstSongId = scored[0]?.song?.id;
               if (firstSongId) {
                 const lyricUrl = `https://music.163.com/api/song/lyric?os=pc&id=${firstSongId}&lv=-1&kv=-1&tv=-1`;
                 const lRes = await fetch(lyricUrl, {
@@ -2192,7 +2215,7 @@ var init_youtubeMusic = __esm({
         }
         const cached = this.streamCache.get(cleanId);
         if (cached && cached.expires > Date.now()) {
-          return cached.data;
+          return applyAudioQuality(cached.data, metadata?.quality);
         }
         const cachedSong = this.songCache.get(cleanId)?.data;
         const titleToSearch = metadata?.title || cachedSong?.title || "";
@@ -2216,7 +2239,7 @@ var init_youtubeMusic = __esm({
                 duration: saavn.duration || cachedSong?.duration
               };
               this.streamCache.set(cleanId, { data: saavnStream, expires: Date.now() + 6 * 3600 * 1e3 });
-              return saavnStream;
+              return applyAudioQuality(saavnStream, metadata?.quality);
             }
           } catch (err) {
             console.warn("[getStream] JioSaavn match notice:", err?.message || err);
@@ -2664,6 +2687,7 @@ async function handleAudioStreamProxy(req, res) {
   let queryArtist = String(req.query.artist || "").trim();
   let queryAlbum = String(req.query.album || "").trim();
   let queryDuration = parseInt(String(req.query.duration || "0"), 10) || void 0;
+  const queryQuality = String(req.query.quality || "").trim();
   if (!id && !queryTitle) {
     const fallbackBuffer = generateMusicalWavBuffer(12);
     return streamWavWithRangeSupport(req, res, fallbackBuffer, "default-empty-id-fallback");
@@ -2699,7 +2723,8 @@ async function handleAudioStreamProxy(req, res) {
       title: queryTitle,
       artist: queryArtist,
       album: queryAlbum,
-      duration: queryDuration
+      duration: queryDuration,
+      quality: queryQuality
     });
     if (stream?.available && stream?.streamUrl && isDirectPlayableCdnUrl(stream.streamUrl)) {
       res.setHeader("Cache-Control", "private, max-age=300");
@@ -2851,7 +2876,9 @@ var init_songs = __esm({
     songsRouter.get("/:id/stream", async (req, res) => {
       const { id } = req.params;
       try {
-        const stream = await youtubeMusicService.getStream(id);
+        const stream = await youtubeMusicService.getStream(id, {
+          quality: String(req.query.quality || "").trim()
+        });
         res.json(stream);
       } catch (err) {
         res.status(503).json({ error: "Playback stream unavailable" });
@@ -2863,6 +2890,7 @@ var init_songs = __esm({
       const queryAlbum = String(req.query.album || "").trim();
       const queryDuration = parseInt(String(req.query.duration || "0"), 10) || void 0;
       const id = String(req.query.id || "").replace(/^(yt_liked_|yt_top_|yt_sync_)/, "").trim();
+      const quality = String(req.query.quality || "").trim();
       let title = queryTitle;
       let artist = queryArtist;
       let album = queryAlbum;
@@ -2880,7 +2908,13 @@ var init_songs = __esm({
         }
       }
       try {
-        const stream = await youtubeMusicService.getStream(id, { title, artist, album, duration });
+        const stream = await youtubeMusicService.getStream(id, {
+          title,
+          artist,
+          album,
+          duration,
+          quality: String(req.query.quality || "").trim()
+        });
         if (stream?.available && stream.streamUrl) {
           return res.json({
             success: true,
@@ -2942,8 +2976,9 @@ var init_songs = __esm({
           const artist = String(track.artist || "").trim();
           const album = String(track.album || "").trim();
           const duration = parseInt(String(track.duration || "0"), 10) || void 0;
+          const quality = String(req.body?.quality || "").trim();
           try {
-            const stream = await youtubeMusicService.getStream(id, { title, artist, album, duration });
+            const stream = await youtubeMusicService.getStream(id, { title, artist, album, duration, quality });
             if (stream?.available && stream.streamUrl && isDirectPlayableCdnUrl(stream.streamUrl)) {
               return { id, streamUrl: stream.streamUrl, duration: stream.duration };
             }
@@ -2960,6 +2995,7 @@ var init_songs = __esm({
       const title = String(req.query.title || "").trim();
       const artist = String(req.query.artist || "").trim();
       const album = String(req.query.album || "").trim();
+      const quality = String(req.query.quality || "").trim();
       const durationHint = parseInt(String(req.query.duration || "0"), 10) || void 0;
       let resolvedUrl = "";
       let resolvedDuration;
@@ -2969,7 +3005,8 @@ var init_songs = __esm({
             title,
             artist,
             album,
-            duration: durationHint
+            duration: durationHint,
+            quality
           });
           if (stream?.available && typeof stream.streamUrl === "string") {
             resolvedUrl = stream.streamUrl;

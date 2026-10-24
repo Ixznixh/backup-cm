@@ -43,6 +43,10 @@ export function parseDuration(duration: any): number {
 export function getBestThumbnail(thumbnails: any, fallback: string = 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=800&q=80'): string {
   if (!thumbnails) return fallback;
   let url = '';
+  // YouTube Music rows carry a MusicThumbnail wrapper: { type, contents: [{ url, width }] }.
+  if (typeof thumbnails === 'object' && Array.isArray(thumbnails.contents)) {
+    thumbnails = thumbnails.contents;
+  }
   if (Array.isArray(thumbnails) && thumbnails.length > 0) {
     const sorted = [...thumbnails].sort((a, b) => (b.width || 0) - (a.width || 0));
     url = sorted[0]?.url || '';
