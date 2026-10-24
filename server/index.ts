@@ -11,8 +11,12 @@ import { imageProxyRouter } from './routes/imageProxy';
 import { ytmusicRouter } from './routes/ytmusic';
 import { youtubeMusicService } from './services/youtubeMusic';
 
-// Pre-warm Innertube engine at server startup for zero-latency instant playback
-youtubeMusicService.getInnertube().catch(() => {});
+// Pre-warm Innertube engine at server startup for zero-latency instant playback.
+// Skipped on serverless: every cold start would pay for it and the instance is short-lived,
+// so it only adds startup work (and a failure mode) to the first request.
+if (!process.env.VERCEL) {
+  youtubeMusicService.getInnertube().catch(() => {});
+}
 
 export const apiRouter = Router();
 
