@@ -102,6 +102,11 @@ YOUTUBE_API_KEY=     # not required, the API is keyless
 To attach a custom domain: Vercel → Project → **Settings → Domains → Add**, then point the
 domain's DNS at Vercel (`A 76.76.21.21` for an apex domain, `CNAME cname.vercel-dns.com` for `www`).
 
+> **After changing anything under `server/`, run `npm run build:api` and commit `api/index.js`.**
+> Vercel packages that file as the serverless function, so the committed bundle is what ships.
+> It is bundled rather than compiled per-file because Vercel runs TypeScript output as native ESM,
+> where the extensionless imports used across `server/` do not resolve.
+
 ---
 
 ## ⚠️ Provider Limitations & Policy Compliance
