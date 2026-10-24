@@ -1,11 +1,13 @@
 /**
  * Vercel serverless entry point.
  *
- * The Express app is created lazily on the first request instead of at module load:
- * serverless cold starts are unforgiving about module-scope work, and if anything in the
- * music stack throws while being imported the whole invocation dies with an opaque
- * FUNCTION_INVOCATION_FAILED. Loading it inside the handler means a failure surfaces as a
- * readable JSON error instead of a blank 500.
+ * `scripts/build-api.mjs` bundles this file into `api/index.js` before Vercel packages the
+ * function. Bundling matters: Vercel compiles each TypeScript file on its own, and the
+ * extensionless relative imports used across `server/` do not resolve as native ESM — which
+ * is why every request failed with "Cannot find module /var/task/server/index".
+ *
+ * The Express app is also created lazily on the first request instead of at module load, so a
+ * failure starting the music stack surfaces as readable JSON instead of FUNCTION_INVOCATION_FAILED.
  */
 
 import express, { type Express, type Request, type Response } from 'express';
@@ -13,7 +15,9 @@ import express, { type Express, type Request, type Response } from 'express';
 let appPromise: Promise<Express> | null = null;
 
 async function createApp(): Promise<Express> {
-  const { apiRouter } = await import('../server/index');
+  // Static relative import: the bundler resolves it at build time, so nothing has to resolve
+  // extensionless TypeScript paths inside the deployed function.
+  const { apiRouter } = await import('./index');
 
   const app = express();
   app.use(express.json());
