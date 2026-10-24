@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { Readable } from 'stream';
 import { youtubeMusicService } from '../services/youtubeMusic';
 import { generateMusicalWavBuffer, streamWavWithRangeSupport } from '../services/audioFallback';
+import { isDirectPlayableCdnUrl } from '../services/jioSaavnService';
 
 export const songsRouter = Router();
 
@@ -13,6 +14,7 @@ export async function handleAudioStreamProxy(req: Request, res: Response) {
   let queryTitle = String(req.query.title || '').trim();
   let queryArtist = String(req.query.artist || '').trim();
   let queryAlbum = String(req.query.album || '').trim();
+  let queryDuration = parseInt(String(req.query.duration || '0'), 10) || undefined;
 
   if (!id && !queryTitle) {
     const fallbackBuffer = generateMusicalWavBuffer(12);
@@ -33,6 +35,7 @@ export async function handleAudioStreamProxy(req: Request, res: Response) {
           queryTitle = songMeta.title || '';
           queryArtist = songMeta.artist || (songMeta as any).artists || '';
           queryAlbum = songMeta.album || '';
+          queryDuration = queryDuration || songMeta.duration || undefined;
         }
       } catch {}
     }
@@ -47,8 +50,21 @@ export async function handleAudioStreamProxy(req: Request, res: Response) {
       } catch {}
     }
 
-    // Direct YouTube Music audio stream resolution (Full Song Stream)
-    const stream = await youtubeMusicService.getStream(targetVidId, { title: queryTitle, artist: queryArtist });
+    // Resolve the real audio stream for this track (JioSaavn 320 kbps first, YouTube as backup)
+    const stream = await youtubeMusicService.getStream(targetVidId, {
+      title: queryTitle,
+      artist: queryArtist,
+      duration: queryDuration,
+    });
+
+    // Direct-playable CDN source (JioSaavn): hand the URL straight to the client.
+    // The CDN supports byte ranges, CORS and lock-screen playback, so the phone streams
+    // from the edge with no proxy hop — this is the zero-latency path.
+    if (stream?.available && stream?.streamUrl && isDirectPlayableCdnUrl(stream.streamUrl)) {
+      res.setHeader('Cache-Control', 'private, max-age=300');
+      res.setHeader('X-Celestial-Audio-Source', 'jiosaavn-cdn-direct');
+      return res.redirect(302, stream.streamUrl);
+    }
 
     if (stream?.available && stream?.streamUrl && typeof stream.streamUrl === 'string' && stream.streamUrl.startsWith('http')) {
       const isIosFormat = stream.format?.includes('mp4') || stream.format?.includes('m4a');
@@ -124,13 +140,15 @@ export async function handleAudioStreamProxy(req: Request, res: Response) {
       }
     }
 
-    // When direct stream is restricted by YouTube BotGuard, return a high-fidelity continuous audio buffer so HTML5 <audio> tag never stalls and iOS background audio continues
-    const wavBuffer = generateMusicalWavBuffer(24);
-    return streamWavWithRangeSupport(req, res, wavBuffer, 'fallback-musical-stream');
+    // No playable source: fail honestly so the client skips the track instead of
+    // pretending to play filler audio.
+    console.info(`[audio] No playable source for ${id} (${queryTitle || 'unknown title'})`);
+    if (res.headersSent) return res.end();
+    return res.status(503).json({ error: 'No playable audio source for this track' });
   } catch (err: any) {
     console.info(`Audio proxy notice for ${id}:`, err?.message || err);
-    const wavBuffer = generateMusicalWavBuffer(24);
-    return streamWavWithRangeSupport(req, res, wavBuffer, 'exception-musical-stream');
+    if (res.headersSent) return res.end();
+    return res.status(503).json({ error: 'Audio stream unavailable' });
   }
 }
 
@@ -222,11 +240,13 @@ songsRouter.get('/resolve', async (req: Request, res: Response) => {
   const queryTitle = String(req.query.title || '').trim();
   const queryArtist = String(req.query.artist || '').trim();
   const queryAlbum = String(req.query.album || '').trim();
+  const queryDuration = parseInt(String(req.query.duration || '0'), 10) || undefined;
   const id = String(req.query.id || '').replace(/^(yt_liked_|yt_top_|yt_sync_)/, '').trim();
 
   let title = queryTitle;
   let artist = queryArtist;
   let album = queryAlbum;
+  let duration = queryDuration;
 
   if (!title && id) {
     try {
@@ -235,32 +255,32 @@ songsRouter.get('/resolve', async (req: Request, res: Response) => {
         title = songMeta.title || '';
         artist = songMeta.artist || (songMeta as any).artists || '';
         album = songMeta.album || '';
+        duration = duration || songMeta.duration || undefined;
       }
     } catch {}
   }
 
-  // Check for embeddable YouTube alternative if standard audio topic might have embedding restrictions
-  let embeddableYtId = id;
-  if (title && id) {
-    try {
-      const yt = await youtubeMusicService.getInnertube();
-      if (yt) {
-        const query = `${title} ${artist} lyrical`.trim();
-        const results = await yt.search(query, { type: 'video' });
-        const match = (results.videos || []).find((v: any) => v.id && v.id !== id);
-        if (match && match.id) {
-          embeddableYtId = match.id;
-        }
-      }
-    } catch {}
+  // Resolve the real stream for this track. When it is a CDN URL the client can play
+  // directly, hand it over so playback needs no further server round trip.
+  try {
+    const stream = await youtubeMusicService.getStream(id, { title, artist, duration });
+    if (stream?.available && stream.streamUrl) {
+      return res.json({
+        success: true,
+        hasDirectCdn: isDirectPlayableCdnUrl(stream.streamUrl),
+        streamUrl: stream.streamUrl,
+        format: stream.format,
+        duration: stream.duration,
+      });
+    }
+  } catch (err: any) {
+    console.info('[resolve] stream lookup notice:', err?.message || err);
   }
 
-  // YouTube Music stream URL with embeddable alternate video ID
   return res.json({
-    success: true,
+    success: false,
     hasDirectCdn: false,
-    embeddableYtId,
-    streamUrl: `/api/song/${encodeURIComponent(id || 'default')}/audio?title=${encodeURIComponent(title)}&artist=${encodeURIComponent(artist)}&album=${encodeURIComponent(album)}`,
+    streamUrl: '',
   });
 });
 
@@ -300,26 +320,69 @@ songsRouter.all('/stream', handleAudioStreamProxy);
 songsRouter.all('/:id/audio', handleAudioStreamProxy);
 songsRouter.all('/:id/stream/audio', handleAudioStreamProxy);
 
+// POST /api/song/prepare
+// Resolves direct CDN URLs for a whole window of upcoming tracks in one invocation, so a
+// track change in the background is a local src swap instead of a cold network request.
+songsRouter.post('/prepare', async (req: Request, res: Response) => {
+  const incoming: any[] = Array.isArray(req.body?.tracks) ? req.body.tracks.slice(0, 8) : [];
+  if (incoming.length === 0) {
+    return res.json({ results: [] });
+  }
+
+  const results = await Promise.all(
+    incoming.map(async (track) => {
+      const rawId = typeof track?.id === 'string' ? track.id : '';
+      const id = rawId.replace(/^(yt_liked_|yt_top_|yt_sync_)/, '').trim();
+      if (!id) return null;
+
+      const title = String(track.title || '').trim();
+      const artist = String(track.artist || '').trim();
+      const duration = parseInt(String(track.duration || '0'), 10) || undefined;
+
+      try {
+        const stream = await youtubeMusicService.getStream(id, { title, artist, duration });
+        if (stream?.available && stream.streamUrl && isDirectPlayableCdnUrl(stream.streamUrl)) {
+          return { id, streamUrl: stream.streamUrl, duration: stream.duration };
+        }
+      } catch {}
+
+      return { id, streamUrl: '', duration: 0 };
+    })
+  );
+
+  return res.json({ results: results.filter(Boolean) });
+});
+
 // GET /api/song/:id/prewarm (Eagerly pre-resolves audio stream for upcoming queue tracks)
 songsRouter.get('/:id/prewarm', async (req: Request, res: Response) => {
   const rawId = req.params.id || '';
   const id = rawId.replace(/^(yt_liked_|yt_top_|yt_sync_)/, '').trim();
   const title = String(req.query.title || '').trim();
   const artist = String(req.query.artist || '').trim();
-  const album = String(req.query.album || '').trim();
+  const durationHint = parseInt(String(req.query.duration || '0'), 10) || undefined;
 
+  // Prewarm awaits the real resolution (it runs ~30s before the track ends), so the next
+  // track can start from a direct CDN URL with zero round trips to this server.
   let resolvedUrl = '';
+  let resolvedDuration: number | undefined;
   if (id) {
-    youtubeMusicService.getStream(id, { title, artist }).then((stream) => {
-      if (stream?.available && stream?.streamUrl) {
+    try {
+      const stream = await youtubeMusicService.getStream(id, {
+        title,
+        artist,
+        duration: durationHint,
+      });
+      if (stream?.available && typeof stream.streamUrl === 'string') {
         resolvedUrl = stream.streamUrl;
+        resolvedDuration = stream.duration;
       }
-    }).catch(() => {});
+    } catch {}
   }
 
-  if (!resolvedUrl && id) {
-    resolvedUrl = `/api/song/${encodeURIComponent(id)}/audio?title=${encodeURIComponent(title)}&artist=${encodeURIComponent(artist)}&album=${encodeURIComponent(album)}`;
-  }
-
-  return res.json({ prewarmed: true, streamUrl: resolvedUrl });
+  return res.json({
+    prewarmed: Boolean(resolvedUrl),
+    direct: isDirectPlayableCdnUrl(resolvedUrl),
+    streamUrl: resolvedUrl,
+    duration: resolvedDuration || durationHint,
+  });
 });

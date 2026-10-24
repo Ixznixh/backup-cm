@@ -29,6 +29,11 @@ import { extractYouTubeVideoId, parseDurationInSeconds } from '../utils/formatte
 import { diagnostics } from './PlaybackDiagnostics';
 import { backgroundAudioManager } from './BackgroundAudioManager';
 import { audioGraph, isIOS } from './AudioGraph';
+import {
+  claimPlaybackAudioSession,
+  releasePlaybackAudioSession,
+  applyLockScreenMetadata,
+} from './AudioSession';
 
 const STORAGE_STATE_KEY = 'celestial_player_playback_state';
 const SILENT_AUDIO_DATA_URI =
@@ -69,6 +74,19 @@ export class AudioPlayer {
   private preloaderAudio: HTMLAudioElement | null = null;
   private lowPowerMode = false;
 
+  // Background resilience: source-switch guard, recovery counters and stall watchdog
+  private isSwitchingSource = false;
+  private switchSourceTimer: number | null = null;
+  private nativeRetryCount = 0;
+  private consecutiveTrackFailures = 0;
+  private lastProgressAt = Date.now();
+  private lastObservedTime = 0;
+  private stallRecoveryCount = 0;
+  private recoveringStream = false;
+  private preparingTrackIds = new Set<string>();
+  private warmedStreamUrl: string | null = null;
+  private prepareTimer: number | null = null;
+
   private state: PlaybackState = {
     currentSong: null,
     isPlaying: false,
@@ -100,10 +118,11 @@ export class AudioPlayer {
     // 2. Setup native event listeners on persistent audio element
     this.setupAudioListeners();
 
-    // 3. Setup YouTube Player in hidden persistent container
-    this.setupYouTubePlayer();
-
-    // 4. Setup Media Session API (Lock screen, Control Center, Android notification)
+    // 3. Claim the OS media audio session (iOS silent-switch bypass + Now Playing).
+    //    The YouTube iframe player is intentionally NOT created here: it is a <video>
+    //    surface that iOS suspends the moment the screen locks, so it is loaded lazily
+    //    and only ever used while the app is on screen.
+    claimPlaybackAudioSession();
     this.setupMediaSession();
 
     // 5. Setup Visibility Continuity (Ensure playback never stops on minimize/lock)
@@ -157,6 +176,7 @@ export class AudioPlayer {
     el.setAttribute('playsinline', 'true');
     el.setAttribute('webkit-playsinline', 'true');
     el.setAttribute('x5-playsinline', 'true');
+    el.setAttribute('x-webkit-airplay', 'allow');
 
     return el;
   }
@@ -353,7 +373,10 @@ export class AudioPlayer {
       }
 
       if (document.visibilityState === 'hidden') {
-        // Tab backgrounded or screen locked: maintain foreground media session lock
+        // Screen locked / app switched: keep the OS media session owned by us and never
+        // touch the YouTube iframe (WebKit suspends iframe media in the background).
+        claimPlaybackAudioSession();
+
         if (this.intendedPlayState) {
           this.state.isPlaying = true;
           this.updateMediaSessionPlaybackState('playing');
@@ -362,11 +385,11 @@ export class AudioPlayer {
           }
           this.updateMediaSessionPosition(true);
 
-          // Ensure native audio element continues playing smoothly in background
-          if (!this.isYTActive && this.audio && this.audio.paused) {
+          // Recover an element that WebKit paused while backgrounding (audio session
+          // still holds the unlock, so this is allowed without a new gesture).
+          if (!this.isYTActive && this.audio && this.audio.paused && this.audio.getAttribute('src')) {
             this.audio.play().catch(() => {});
           }
-          // Note: Never call ytPlayer.playVideo() while hidden - iOS WebKit terminates video iframes
         }
       } else if (document.visibilityState === 'visible') {
         // Tab brought to foreground: re-sync state & UI
@@ -383,12 +406,16 @@ export class AudioPlayer {
             this.state.duration = this.audio.duration;
           }
         }
+
         if (this.intendedPlayState) {
           this.state.isPlaying = true;
           this.updateMediaSessionPosition();
           this.updateMediaSessionPlaybackState('playing');
-          if (this.ytPlayer && typeof this.ytPlayer.playVideo === 'function') {
+          if (this.isYTActive && this.ytPlayer && typeof this.ytPlayer.playVideo === 'function') {
             try { this.ytPlayer.playVideo(); } catch {}
+          } else if (this.audio && this.audio.paused && this.audio.getAttribute('src')) {
+            // Playback was suspended while backgrounded — resume it.
+            this.audio.play().catch(() => {});
           }
         }
         this.notify();
@@ -452,11 +479,48 @@ export class AudioPlayer {
             this.notify();
           }
 
+          // Stall watchdog: a backgrounded iPhone silently drops the media connection
+          // (expired CDN token, radio hand-off, app suspension). Detect "claims to play but
+          // the clock never advances" and re-open the stream at the same position instead
+          // of leaving the user with dead silence behind a lock screen that says Playing.
+          if (curTime > this.lastObservedTime + 0.15) {
+            this.lastObservedTime = curTime;
+            this.lastProgressAt = Date.now();
+            this.stallRecoveryCount = 0;
+          }
+
+          if (
+            !this.recoveringStream &&
+            !this.isYTActive &&
+            this.intendedPlayState &&
+            this.audio &&
+            !this.audio.paused &&
+            this.audio.readyState >= 2 &&
+            dur > 0 &&
+            curTime < dur - 1 &&
+            Date.now() - this.lastProgressAt > 20000
+          ) {
+            if (this.stallRecoveryCount < 2 && this.state.currentSong) {
+              this.stallRecoveryCount++;
+              console.warn('[AudioPlayer] Background stream stalled — re-opening at', curTime.toFixed(1));
+              this.lastProgressAt = Date.now();
+              this.reloadNativeStream(this.state.currentSong, curTime);
+            } else {
+              this.lastProgressAt = Date.now();
+              this.handleNativePlaybackFailure(this.state.currentSong, 'Stream stalled');
+            }
+          }
+
           // Proactively prewarm next track before current song ends.
           // In Low Power Mode, delay prewarming until 10s before track end and suppress extra suggestion polling
           const prewarmThreshold = this.lowPowerMode ? 10 : 30;
           if (dur && dur > 0 && curTime > 0 && dur - curTime <= prewarmThreshold) {
             this.preloadNextTrack();
+            // Warm the socket + first bytes of the next stream so the transition does not
+            // pay for a TLS handshake and radio wake-up while the phone is locked.
+            if (dur - curTime <= 8) {
+              this.warmNextStream();
+            }
             if (!this.lowPowerMode) {
               const upcoming = this.queueManager.getUpcomingTracks();
               if (upcoming.length < 2 && this.state.currentSong && !this.isFetchingSuggestions) {
@@ -547,6 +611,11 @@ export class AudioPlayer {
     });
 
     el.addEventListener('playing', () => {
+      this.endSourceSwitch();
+      this.nativeRetryCount = 0;
+      this.consecutiveTrackFailures = 0;
+      this.recoveringStream = false;
+      this.lastProgressAt = Date.now();
       this.state.isPlaying = true;
       this.state.isBuffering = false;
       this.state.error = null;
@@ -556,31 +625,194 @@ export class AudioPlayer {
       this.notify();
     });
 
+    /**
+     * A pause we did not request comes from the OS: an incoming call, Siri, another app
+     * taking the audio session, headphones being unplugged, or the user pressing pause
+     * on the lock screen / Control Center. Reflect it as a real paused state so the Now
+     * Playing card (and the in-app UI) show the truth and offer a Play button, and drop
+     * our play intent so we never fight the user by resuming on our own.
+     */
     el.addEventListener('pause', () => {
-      if (!this.intendedPlayState) {
-        this.state.isPlaying = false;
-        this.updateMediaSessionPlaybackState('paused');
-        this.updateMediaSessionPosition(true);
-        this.updateMediaSessionHandlers();
-        this.notify();
+      if (this.isYTActive || this.isSwitchingSource) return;
+
+      if (this.intendedPlayState) {
+        this.intendedPlayState = false;
+        diagnostics.recordExplicitPause('OS interruption or lock-screen pause');
       }
+
+      this.state.isPlaying = false;
+      this.state.isBuffering = false;
+      this.updateMediaSessionPlaybackState('paused');
+      this.updateMediaSessionPosition(true);
+      this.updateMediaSessionHandlers();
+      this.notify();
     });
 
     el.addEventListener('ended', () => {
       if (!this.isYTActive) {
+        this.endSourceSwitch();
         this.handleTrackEnded();
       }
     });
 
     el.addEventListener('error', () => {
-      if (!this.isYTActive && this.state.currentSong) {
-        console.warn('[AudioPlayer] Native audio stream error, falling back to YouTube iframe');
-        const cleanId =
-          extractYouTubeVideoId(this.state.currentSong.id) ||
-          this.state.currentSong.id.replace(/^(yt_liked_|yt_top_|yt_sync_)/, '').trim();
-        this.playViaYouTube(cleanId, this.state.currentTime, this.playbackSessionId);
-      }
+      if (this.isYTActive || !this.state.currentSong) return;
+      if (!this.audio.getAttribute('src')) return; // src cleared during teardown, not a failure
+
+      this.endSourceSwitch();
+      const mediaError = this.audio.error;
+      console.warn(
+        '[AudioPlayer] Native audio stream error:',
+        mediaError ? `code ${mediaError.code}` : 'unknown',
+        '— recovering on the native pipeline'
+      );
+
+      // Never hand playback to the YouTube iframe in the background: it is a video surface
+      // that iOS suspends on lock, which is exactly the bug we are avoiding.
+      this.handleNativePlaybackFailure(this.state.currentSong, 'Native stream error');
     });
+  }
+
+  // --- Background Resilience Helpers ---
+
+  /** Marks the window where a src swap fires pause/emptied so it is not read as an OS pause. */
+  private beginSourceSwitch(): void {
+    this.isSwitchingSource = true;
+    if (this.switchSourceTimer !== null) {
+      window.clearTimeout(this.switchSourceTimer);
+    }
+    this.switchSourceTimer = window.setTimeout(() => {
+      this.isSwitchingSource = false;
+      this.switchSourceTimer = null;
+    }, 5000);
+  }
+
+  private endSourceSwitch(): void {
+    this.isSwitchingSource = false;
+    if (this.switchSourceTimer !== null) {
+      window.clearTimeout(this.switchSourceTimer);
+      this.switchSourceTimer = null;
+    }
+  }
+
+  /**
+   * Single source of truth for the native stream URL of a track.
+   * `bustCache` forces a fresh proxy URL so a dead CDN token / failed response is not
+   * reused from the HTTP cache when we recover mid-track.
+   */
+  private buildNativeStreamUrl(song: Song, cleanId: string, bustCache = false): string {
+    const isDirectSource =
+      song.streamUrl &&
+      (song.streamUrl.startsWith('blob:') ||
+        song.streamUrl.startsWith('data:') ||
+        song.streamUrl.startsWith('https://aac.saavncdn.com/'));
+
+    // A cached direct CDN URL can go stale (token/region changes). When recovering we
+    // deliberately skip both client caches and let the server resolve a fresh URL.
+    if (isDirectSource && !bustCache) return song.streamUrl as string;
+
+    if (!bustCache) {
+      const cached = this.streamUrlCache.get(cleanId);
+      if (cached) return cached;
+    }
+
+    const proxyUrl = `/api/song/${encodeURIComponent(cleanId)}/audio?title=${encodeURIComponent(
+      song.title || ''
+    )}&artist=${encodeURIComponent(song.artist || '')}&album=${encodeURIComponent(
+      song.album || ''
+    )}&duration=${Math.round(Number(song.duration) || 0)}`;
+
+    return bustCache ? `${proxyUrl}&_r=${Date.now()}` : proxyUrl;
+  }
+
+  /**
+   * Re-opens the native stream at the current position without user interaction.
+   * Used when the media connection dies in the background or WebKit drops the load.
+   */
+  private reloadNativeStream(song: Song, atSeconds: number): void {
+    if (!song || this.recoveringStream) return;
+
+    const cleanId =
+      extractYouTubeVideoId(song.id) || song.id.replace(/^(yt_liked_|yt_top_|yt_sync_)/, '').trim();
+    const url = this.buildNativeStreamUrl(song, cleanId, true);
+
+    this.recoveringStream = true;
+    this.intendedPlayState = true;
+    this.isYTActive = false;
+    this.beginSourceSwitch();
+    this.state.isBuffering = true;
+    this.lastProgressAt = Date.now();
+    this.notify();
+
+    const seekAfterLoad = () => {
+      const target = Math.max(0, atSeconds || 0);
+      if (Number.isFinite(this.audio.duration) && this.audio.duration > 0 && target < this.audio.duration) {
+        try {
+          this.audio.currentTime = target;
+        } catch {}
+      }
+    };
+
+    try {
+      this.audio.addEventListener('loadedmetadata', seekAfterLoad, { once: true });
+      this.audio.volume = this.state.isMuted ? 0 : this.state.volume;
+      this.audio.loop = false;
+      this.audio.src = url;
+      this.updateMediaSessionPlaybackState('playing');
+      const result = this.audio.play();
+      if (result && typeof result.catch === 'function') {
+        result.catch(() => {});
+      }
+    } catch {
+      // The watchdog retries on the next tick if this attempt did not take.
+    } finally {
+      window.setTimeout(() => {
+        this.recoveringStream = false;
+      }, 15000);
+    }
+  }
+
+  /**
+   * Native audio failed. Retry the direct stream a couple of times (works in the
+   * background), then skip forward like Spotify instead of switching to the YouTube
+   * iframe, which iOS suspends as soon as the screen locks.
+   */
+  private async handleNativePlaybackFailure(song: Song | null, reason: string): Promise<void> {
+    const current = song || this.state.currentSong;
+    if (!current) return;
+
+    if (!this.intendedPlayState) {
+      this.state.isBuffering = false;
+      return;
+    }
+
+    if (this.nativeRetryCount < 2) {
+      this.nativeRetryCount++;
+      const resumeAt = Number.isFinite(this.state.currentTime) ? this.state.currentTime : 0;
+      window.setTimeout(() => {
+        if (!this.intendedPlayState || this.state.currentSong?.id !== current.id) return;
+        this.recoveringStream = false;
+        this.reloadNativeStream(current, resumeAt);
+      }, 800 * this.nativeRetryCount);
+      return;
+    }
+
+    this.consecutiveTrackFailures++;
+    this.state.isBuffering = false;
+    console.warn(
+      `[AudioPlayer] ${reason} — retries exhausted for "${current.title}" (${this.consecutiveTrackFailures} in a row)`
+    );
+
+    if (this.consecutiveTrackFailures <= 3) {
+      this.nativeRetryCount = 0;
+      this.recoveringStream = false;
+      await this.playNextTrack();
+      return;
+    }
+
+    this.state.error = 'Playback unavailable. Tap play to retry.';
+    this.pause('Playback unavailable');
+    releasePlaybackAudioSession();
   }
 
   // --- State Access & Subscriptions ---
@@ -630,6 +862,15 @@ export class AudioPlayer {
   private async startPlayback(song: Song, startSeconds: number = 0): Promise<void> {
     const currentSession = ++this.playbackSessionId;
     this.intendedPlayState = true;
+    claimPlaybackAudioSession();
+
+    // Fresh track: reset per-track recovery counters (consecutive-failure streak is kept
+    // so a run of unplayable tracks still trips the circuit breaker).
+    this.nativeRetryCount = 0;
+    this.stallRecoveryCount = 0;
+    this.recoveringStream = false;
+    this.lastObservedTime = 0;
+    this.lastProgressAt = Date.now();
 
     // Instant UI state update
     this.state.currentSong = song;
@@ -649,11 +890,19 @@ export class AudioPlayer {
     // 2. Start background audio anchor (WakeLock & AudioContext unlock)
     backgroundAudioManager.startPlaybackAnchor(song);
 
-    // 3. Cache recently played in IndexedDB
-    db.addRecentlyPlayed(song).catch(() => {});
+    // 3. Cache recently played in IndexedDB — deferred so persistence never competes with
+    //    the audio pipeline during the transition.
     const upcomingTracks = this.queueManager.getUpcomingTracks();
     const nextSong = upcomingTracks.length > 0 ? upcomingTracks[0] : null;
-    db.cacheCurrentAndNextTrack(song, nextSong, this.queueManager.getQueue(), this.queueManager.getQueueIndex()).catch(() => {});
+    this.runWhenIdle(() => {
+      db.addRecentlyPlayed(song).catch(() => {});
+      db.cacheCurrentAndNextTrack(
+        song,
+        nextSong,
+        this.queueManager.getQueue(),
+        this.queueManager.getQueueIndex()
+      ).catch(() => {});
+    });
 
     const cleanId = extractYouTubeVideoId(song.id) || song.id.replace(/^(yt_liked_|yt_top_|yt_sync_)/, '').trim();
 
@@ -661,18 +910,19 @@ export class AudioPlayer {
     // Streaming directly through the persistent <audio id="audioPlayer"> element guarantees
     // 100% unbreakable background & lock-screen playback on iOS WebKit and Android Chrome.
     const isDirectBlob = song.streamUrl && (song.streamUrl.startsWith('blob:') || song.streamUrl.startsWith('data:') || song.streamUrl.startsWith('https://aac.saavncdn.com/'));
-    const cachedUrl = this.streamUrlCache.get(cleanId);
-    
+    const cachedUrl = isDirectBlob ? null : this.streamUrlCache.get(cleanId);
+
     // Choose ultra-low-latency direct CDN stream url if available, or robust direct server proxy
-    const audioStreamUrl = isDirectBlob
-      ? song.streamUrl!
-      : (cachedUrl || `/api/song/${encodeURIComponent(cleanId)}/audio?title=${encodeURIComponent(song.title)}&artist=${encodeURIComponent(song.artist || '')}&album=${encodeURIComponent(song.album || '')}`);
+    const audioStreamUrl = this.buildNativeStreamUrl(song, cleanId);
 
     this.isYTActive = false;
     this.audio.volume = this.state.isMuted ? 0 : this.state.volume;
     this.audio.loop = false;
     if (this.audio.src !== audioStreamUrl && !this.audio.src.endsWith(audioStreamUrl)) {
+      this.beginSourceSwitch();
       this.audio.src = audioStreamUrl;
+      // The warmed preloader has done its job; stop it so the track is not fetched twice.
+      this.releasePreloader();
     }
     if (startSeconds > 0) {
       try { this.audio.currentTime = startSeconds; } catch {}
@@ -722,7 +972,9 @@ export class AudioPlayer {
       fetch(
         `/api/song/resolve?id=${encodeURIComponent(cleanId)}&title=${encodeURIComponent(
           song.title
-        )}&artist=${encodeURIComponent(song.artist || '')}&album=${encodeURIComponent(song.album || '')}`
+        )}&artist=${encodeURIComponent(song.artist || '')}&album=${encodeURIComponent(
+          song.album || ''
+        )}&duration=${Math.round(Number(song.duration) || 0)}`
       )
         .then((res) => res.json())
         .then((data) => {
@@ -737,18 +989,102 @@ export class AudioPlayer {
     // 6. Prewarm next track on the server for instant gapless playback
     this.preloadNextTrack();
 
-    // 7. Keep upcoming recommendations populated (defer in Low Power Mode to save radio wakeups)
-    if (!this.lowPowerMode && upcomingTracks.length < 3) {
-      this.loadSuggestions(song.id, false);
-    } else if (this.lowPowerMode && upcomingTracks.length === 0) {
+    // 7. Keep the queue stocked and the upcoming stream URLs pre-resolved so the next
+    //    transition is a pure src swap — no network round trip, no dead air.
+    if (upcomingTracks.length < 2) {
       this.loadSuggestions(song.id, false);
     }
+  }
+
+  /** Runs non-critical work off the playback path (idle callback, with a bounded fallback). */
+  private runWhenIdle(task: () => void): void {
+    if (typeof window === 'undefined') return;
+    const requestIdle = (window as any).requestIdleCallback;
+    if (typeof requestIdle === 'function') {
+      try {
+        requestIdle(task, { timeout: 2000 });
+        return;
+      } catch {}
+    }
+    window.setTimeout(task, 800);
+  }
+
+  /** Normalises track ids into the key used by the stream URL caches. */
+  private cleanStreamId(id: string | undefined | null): string {
+    if (!id) return '';
+    return extractYouTubeVideoId(id) || id.replace(/^(yt_liked_|yt_top_|yt_sync_)/, '').trim();
+  }
+
+  /**
+   * Resolves the direct CDN URLs for the next few tracks in a single request.
+   * One serverless invocation for the whole window instead of one cold request per track,
+   * so the following tracks can start instantly even with the screen locked.
+   */
+  private prepareUpcoming(): void {
+    if (typeof fetch !== 'function' || typeof window === 'undefined') return;
+
+    // Give the just-started stream a head start: the prepare request must never compete
+    // with the audio bytes that are opening right now.
+    if (this.prepareTimer !== null) return;
+    this.prepareTimer = window.setTimeout(() => {
+      this.prepareTimer = null;
+      this.runPrepareUpcoming();
+    }, 1500);
+  }
+
+  private runPrepareUpcoming(): void {
+    const upcoming = this.queueManager.getUpcomingTracks().slice(0, 5);
+    const pending = upcoming.filter((track) => {
+      const id = this.cleanStreamId(track.id);
+      return Boolean(id) && !this.streamUrlCache.has(id) && !this.preparingTrackIds.has(id);
+    });
+    if (pending.length === 0) return;
+
+    pending.forEach((track) => this.preparingTrackIds.add(this.cleanStreamId(track.id)));
+
+    const payload = {
+      tracks: pending.map((track) => ({
+        id: this.cleanStreamId(track.id),
+        title: track.title || '',
+        artist: track.artist || '',
+        duration: Math.round(Number(track.duration) || 0),
+      })),
+    };
+
+    fetch('/api/song/prepare', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        const results: Array<{ id?: string; streamUrl?: string }> = data?.results || [];
+        for (const item of results) {
+          if (!item?.id || !item.streamUrl) continue;
+          this.streamUrlCache.set(item.id, item.streamUrl);
+          const match = pending.find((track) => this.cleanStreamId(track.id) === item.id);
+          if (match) match.streamUrl = item.streamUrl;
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        pending.forEach((track) => this.preparingTrackIds.delete(this.cleanStreamId(track.id)));
+      });
   }
 
   /**
    * Fallback playback via YouTube Iframe if native audio stream is unavailable
    */
   private playViaYouTube(cleanId: string, startSeconds: number = 0, currentSession: number = 0): void {
+    // An embedded YouTube player is a video surface: iOS suspends it the moment the screen
+    // locks or the home-screen PWA is backgrounded. Never route audio through it while
+    // hidden — stay on the native <audio> pipeline, retry, then skip if it is unplayable.
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+      console.info('[AudioPlayer] Backgrounded — keeping the native audio pipeline (no iframe)');
+      void this.handleNativePlaybackFailure(this.state.currentSong, 'Native playback rejected in background');
+      return;
+    }
+
     this.isYTActive = true;
 
     // Silence native audio element to prevent conflicting sounds or error popups
@@ -808,9 +1144,57 @@ export class AudioPlayer {
   }
 
   /**
+   * Opens the CDN connection for the next track a few seconds before it starts.
+   * This is what removes the modem wake-up / TLS handshake delay when the phone is locked:
+   * by the time `ended` fires, the socket and first bytes are already warm. The preloader is
+   * released on the transition so it never downloads the track twice.
+   */
+  private warmNextStream(): void {
+    if (typeof document === 'undefined') return;
+
+    const nextTrack = this.queueManager.getUpcomingTracks()[0];
+    if (!nextTrack) return;
+
+    const id = this.cleanStreamId(nextTrack.id);
+    const cached = this.streamUrlCache.get(id);
+    const url =
+      cached ||
+      (nextTrack.streamUrl && nextTrack.streamUrl.startsWith('https://') ? nextTrack.streamUrl : '');
+
+    if (!url || this.warmedStreamUrl === url) return;
+
+    try {
+      if (!this.preloaderAudio) {
+        this.preloaderAudio = new Audio();
+        this.preloaderAudio.preload = 'auto';
+        this.preloaderAudio.muted = true;
+        this.preloaderAudio.setAttribute('playsinline', 'true');
+        this.preloaderAudio.setAttribute('aria-hidden', 'true');
+        this.preloaderAudio.style.display = 'none';
+        if (document.body) document.body.appendChild(this.preloaderAudio);
+      }
+      this.warmedStreamUrl = url;
+      this.preloaderAudio.src = url;
+      this.preloaderAudio.load();
+    } catch {}
+  }
+
+  private releasePreloader(): void {
+    this.warmedStreamUrl = null;
+    if (!this.preloaderAudio) return;
+    try {
+      this.preloaderAudio.removeAttribute('src');
+      this.preloaderAudio.load();
+    } catch {}
+  }
+
+  /**
    * Prewarms the next upcoming track on the backend and pre-buffers it for 0-latency playback.
    */
   public preloadNextTrack(): void {
+    // Keep the whole upcoming window resolved, not just the immediate next track.
+    this.prepareUpcoming();
+
     const upcoming = this.queueManager.getUpcomingTracks();
     const nextTrack = upcoming.length > 0 ? upcoming[0] : null;
     if (!nextTrack) return;
@@ -824,20 +1208,15 @@ export class AudioPlayer {
       fetch(
         `/api/song/${encodeURIComponent(cleanId)}/prewarm?title=${encodeURIComponent(
           nextTrack.title || ''
-        )}&artist=${encodeURIComponent(nextTrack.artist || '')}&album=${encodeURIComponent(nextTrack.album || '')}`
+        )}&artist=${encodeURIComponent(nextTrack.artist || '')}&album=${encodeURIComponent(
+          nextTrack.album || ''
+        )}&duration=${Math.round(Number(nextTrack.duration) || 0)}`
       )
         .then((res) => res.json())
         .then((data) => {
           if (data?.streamUrl && typeof data.streamUrl === 'string' && data.streamUrl.startsWith('http')) {
             this.streamUrlCache.set(cleanId, data.streamUrl);
             nextTrack.streamUrl = data.streamUrl;
-            if (!isIOS()) {
-              if (!this.preloaderAudio) {
-                this.preloaderAudio = new Audio();
-              }
-              this.preloaderAudio.preload = 'auto';
-              this.preloaderAudio.src = data.streamUrl;
-            }
           }
         })
         .catch(() => {});
@@ -852,7 +1231,9 @@ export class AudioPlayer {
           fetch(
             `/api/song/resolve?id=${encodeURIComponent(secondCleanId)}&title=${encodeURIComponent(
               secondTrack.title || ''
-            )}&artist=${encodeURIComponent(secondTrack.artist || '')}&album=${encodeURIComponent(secondTrack.album || '')}`
+            )}&artist=${encodeURIComponent(secondTrack.artist || '')}&album=${encodeURIComponent(
+              secondTrack.album || ''
+            )}&duration=${Math.round(Number(secondTrack.duration) || 0)}`
           )
             .then((res) => res.json())
             .then((data) => {
@@ -935,7 +1316,15 @@ export class AudioPlayer {
     if (!song) return;
 
     backgroundAudioManager.startPlaybackAnchor(song);
+    claimPlaybackAudioSession();
     this.intendedPlayState = true;
+
+    // Restored session with no src yet (fresh launch / after an interruption): load the
+    // stream instead of calling play() on an empty element.
+    if (!this.isYTActive && (!this.audio.getAttribute('src') || this.audio.networkState === 0)) {
+      await this.startPlayback(song, this.state.currentTime || 0);
+      return;
+    }
 
     if (!this.isYTActive && this.audio) {
       this.audio.volume = this.state.isMuted ? 0 : this.state.volume;
@@ -1043,18 +1432,42 @@ export class AudioPlayer {
   public async playNextTrack(): Promise<void> {
     const nextSong = this.queueManager.next();
     if (nextSong) {
+      // Hot path: the next track is already known and its stream URL is usually pre-resolved,
+      // so startPlayback() swaps the src and calls play() synchronously.
       await this.startPlayback(nextSong, 0);
-    } else {
-      if (this.state.currentSong) {
-        await this.loadSuggestions(this.state.currentSong.id, false);
-        const retryNext = this.queueManager.next();
-        if (retryNext) {
-          await this.startPlayback(retryNext, 0);
-          return;
-        }
-      }
-      // If there is no next track, safely do nothing
+      return;
     }
+
+    // Queue exhausted. Refill in the background and start the first track the moment it
+    // lands — never await a network round trip on the transition itself. Awaiting the
+    // radio/suggestions request here caused multi-second dead air between tracks while
+    // the screen was locked.
+    const currentId = this.state.currentSong?.id;
+    if (!currentId) return;
+
+    this.state.isBuffering = true;
+    this.notify();
+    void this.refillQueueAndContinue(currentId);
+  }
+
+  private async refillQueueAndContinue(afterSongId: string): Promise<void> {
+    try {
+      await this.loadSuggestions(afterSongId, true);
+    } catch {}
+
+    const nextSong = this.queueManager.next();
+    if (nextSong && this.intendedPlayState) {
+      await this.startPlayback(nextSong, 0);
+      return;
+    }
+
+    // Nothing came back (offline, or the provider refused this track): stop cleanly instead
+    // of leaving the UI claiming to play a finished track.
+    this.state.isBuffering = false;
+    this.state.isPlaying = false;
+    this.updateMediaSessionPlaybackState('paused');
+    this.updateMediaSessionPosition(true);
+    this.notify();
   }
 
   /**
@@ -1280,6 +1693,8 @@ export class AudioPlayer {
       this.pause();
       this.seek(0);
       this.updateMediaSessionPlaybackState('none');
+      // Give the audio session back to the system so the ringer switch behaves normally.
+      releasePlaybackAudioSession();
     });
 
     // 2. Previous Track & Next Track (Connected to existing queue/playlist logic)
@@ -1330,48 +1745,23 @@ export class AudioPlayer {
   public updateMediaSessionMetadata(song: Song | null): void {
     if (typeof navigator === 'undefined' || !('mediaSession' in navigator) || !song) return;
 
-    try {
-      const isYtId = song.id && song.id.length === 11 && !song.id.includes(' ');
-      const rawArt =
-        song.artwork ||
-        song.artworkUrl ||
-        (isYtId ? `https://i.ytimg.com/vi/${song.id}/hqdefault.jpg` : '/pwa-512x512.png');
+    // Publishes title/artist/album plus correctly-sized artwork immediately, then
+    // republishes once with the generated 96x96 square thumbnail so the iOS compact
+    // lock-screen player shows real art instead of a grey box.
+    const songId = song.id;
+    const pendingThumbnail = applyLockScreenMetadata(song);
 
-      let primaryArt = rawArt;
-      if (typeof window !== 'undefined' && rawArt && !rawArt.startsWith('http://') && !rawArt.startsWith('https://')) {
-        try {
-          primaryArt = new URL(rawArt, window.location.origin).href;
-        } catch {}
-      }
+    this.updateMediaSessionPosition(true);
+    this.updateMediaSessionHandlers();
 
-      const artworkList: MediaImage[] = [
-        { src: primaryArt, sizes: '96x96', type: 'image/jpeg' },
-        { src: primaryArt, sizes: '128x128', type: 'image/jpeg' },
-        { src: primaryArt, sizes: '192x192', type: 'image/jpeg' },
-        { src: primaryArt, sizes: '256x256', type: 'image/jpeg' },
-        { src: primaryArt, sizes: '384x384', type: 'image/jpeg' },
-        { src: primaryArt, sizes: '512x512', type: 'image/jpeg' },
-      ];
-
-      if (isYtId) {
-        artworkList.push(
-          { src: `https://i.ytimg.com/vi/${song.id}/maxresdefault.jpg`, sizes: '1280x720', type: 'image/jpeg' },
-          { src: `https://i.ytimg.com/vi/${song.id}/sddefault.jpg`, sizes: '640x480', type: 'image/jpeg' },
-          { src: `https://i.ytimg.com/vi/${song.id}/hqdefault.jpg`, sizes: '480x360', type: 'image/jpeg' }
-        );
-      }
-
-      navigator.mediaSession.metadata = new MediaMetadata({
-        title: song.title || 'Unknown Track',
-        artist: song.artist || (song as any).artists || 'Celestial Music',
-        album: song.album || 'Celestial Music',
-        artwork: artworkList,
-      });
-
-      this.updateMediaSessionPosition(true);
-      this.updateMediaSessionHandlers();
-    } catch (err) {
-      console.warn('[AudioPlayer] Failed to set MediaSession metadata:', err);
+    if (pendingThumbnail) {
+      pendingThumbnail
+        .then((thumbnail) => {
+          if (!thumbnail) return;
+          if (this.state.currentSong?.id !== songId) return; // track changed meanwhile
+          applyLockScreenMetadata(this.state.currentSong);
+        })
+        .catch(() => {});
     }
   }
 

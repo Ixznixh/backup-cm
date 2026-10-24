@@ -49,12 +49,20 @@ Starts `node dist/server.cjs` listening on port `3000` (and `0.0.0.0` for contai
 - **Provider Isolation**: Provider internals are strictly isolated to the server. The client never imports `youtubei.js` directly and consumes only normalized JSON.
 - **Zero API Keys Required**: No YouTube Data API key or Google API key is needed for standard operation.
 
+### Audio resolution
+- **Primary source**: JioSaavn 320 kbps AAC. Tracks are matched by title, artist and duration so the audio always belongs to the song on screen; weak matches are rejected instead of playing the wrong recording.
+- **Fallback**: YouTube Music (`youtubei.js`). Stream extraction is refused by YouTube on many datacenter IPs, so this is a backup, not the default.
+- **Direct CDN playback**: resolved JioSaavn URLs are CDN-hosted with HTTP Range + CORS support, so `/api/song/:id/audio` answers with a `302` and the client streams straight from the edge — no proxy hop, real seeking, and reliable iOS lock-screen playback. `/prewarm` hands over the next track's direct URL so track changes need no server round trip.
+- **No filler audio**: if nothing playable can be resolved the endpoint returns `503` and the player skips the track. (Generated test tones remain available only for explicit `test-*` / `celestial-*` diagnostic ids.)
+
 ### Endpoints
 - `GET /api/home` - Real home feed sections (Quick Picks, Recommended, Trending, Charts)
 - `GET /api/search?q=:query` - Search songs, artists, albums, and playlists
 - `GET /api/search/suggestions?q=:query` - Real search auto-complete suggestions
 - `GET /api/song/:id` - Normalized track metadata
-- `GET /api/song/:id/audio` - Real audio streaming with HTTP 206 Byte Range support
+- `GET /api/song/:id/audio` - Real audio: `302` to the direct CDN stream, or a proxied `206` range stream for sources that need server headers
+- `POST /api/song/prepare` - Resolves direct CDN URLs for a batch of upcoming tracks in one call (keeps background track changes instant)
+- `GET /api/song/:id/prewarm` - Pre-resolves the next track so a transition needs no server round trip
 - `GET /api/album/:id` - Album metadata and full tracklist
 - `GET /api/artist/:id` - Artist overview, top songs, albums, and singles
 - `GET /api/playlist/:id` - Playlist metadata and items
@@ -71,6 +79,28 @@ To enable offline/mock test data:
 ```env
 VITE_DEMO_MODE=true
 ```
+
+---
+
+## 🚀 Deploy to Vercel
+
+The frontend is a static Vite build; the music API runs as one Express function in `api/index.ts`
+(the resolver has to be server-side because the catalogue API blocks browser requests via CORS).
+
+1. Push this repo to GitHub.
+2. In Vercel, **Add New → Project** and import the repository.
+   Framework preset, build command and output directory are read from `vercel.json` — do not override them.
+3. Deploy. The site is live at `https://<project>.vercel.app`.
+
+Optional environment variables (all have working defaults):
+
+```env
+GEMINI_API_KEY=      # AI-written lyrics, optional
+YOUTUBE_API_KEY=     # not required, the API is keyless
+```
+
+To attach a custom domain: Vercel → Project → **Settings → Domains → Add**, then point the
+domain's DNS at Vercel (`A 76.76.21.21` for an apex domain, `CNAME cname.vercel-dns.com` for `www`).
 
 ---
 

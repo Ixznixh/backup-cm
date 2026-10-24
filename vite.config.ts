@@ -20,6 +20,9 @@ export default defineConfig(() => {
           theme_color: '#0a0a0c',
           background_color: '#0a0a0c',
           display: 'standalone',
+          display_override: ['standalone', 'minimal-ui'],
+          orientation: 'portrait-primary',
+          categories: ['music', 'entertainment'],
           start_url: '/',
           scope: '/',
           icons: [
@@ -44,45 +47,18 @@ export default defineConfig(() => {
           ],
         },
         workbox: {
-          globPatterns: ['**/*.{js,css,html,ico,png,svg}'],
+          // App shell only. Media must never be intercepted by the service worker:
+          // audio is fetched with HTTP Range requests, and caching partial (206) responses
+          // stalls playback and breaks seeking on iOS WebKit. The browser's own media cache
+          // handles streaming (including background playback) correctly.
+          globPatterns: ['**/*.{js,css,html,ico,png,svg,webmanifest}'],
+          navigateFallback: '/index.html',
           navigateFallbackDenylist: [/^\/api\//],
-          runtimeCaching: [
-            {
-              urlPattern: ({ url }) => url.pathname.includes('/audio') || url.pathname.endsWith('.mp4') || url.pathname.endsWith('.m4a') || url.pathname.endsWith('.mp3'),
-              handler: 'StaleWhileRevalidate',
-              options: {
-                cacheName: 'celestial-audio-segments',
-                expiration: {
-                  maxEntries: 100,
-                  maxAgeSeconds: 7 * 24 * 60 * 60, // 7 days
-                },
-                cacheableResponse: {
-                  statuses: [0, 200, 206],
-                },
-                matchOptions: {
-                  ignoreSearch: false,
-                },
-              },
-            },
-            {
-              urlPattern: ({ url }) => url.pathname.startsWith('/api/song/') && !url.pathname.includes('/audio'),
-              handler: 'StaleWhileRevalidate',
-              options: {
-                cacheName: 'celestial-api-cache',
-                expiration: {
-                  maxEntries: 120,
-                  maxAgeSeconds: 24 * 60 * 60,
-                },
-                cacheableResponse: {
-                  statuses: [0, 200],
-                },
-              },
-            },
-          ],
+          cleanupOutdatedCaches: true,
+          runtimeCaching: [],
         },
         devOptions: {
-          enabled: true,
-          type: 'module',
+          enabled: false,
         },
       }),
     ],

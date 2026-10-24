@@ -525,9 +525,11 @@ class CelestialDatabase {
         }
       });
 
-      // Silently download the audio blobs for true offline playback locally in IndexedDB
-      this.ensureAudioBlobCached(currentSong).catch(() => {});
-      this.ensureAudioBlobCached(nextSong).catch(() => {});
+      // NOTE: do not pre-download audio blobs here. This runs on every track change, and
+      // silently pulling the current + next track into IndexedDB competes with the stream
+      // that is actually playing, which delays the next track's first bytes (very visible
+      // when the phone is locked or on cellular). Explicit downloads still use
+      // ensureAudioBlobCached / downloadTrackWithProgress on their own.
     } catch (err) {
       console.warn('Failed to cache current/next tracks to IndexedDB:', err);
     }

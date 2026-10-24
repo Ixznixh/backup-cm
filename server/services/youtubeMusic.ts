@@ -1726,7 +1726,10 @@ class YouTubeMusicService {
    * Playback Stream Handler
    * Strictly respects authorized playback mechanisms.
    */
-  public async getStream(id: string, metadata?: { title?: string; artist?: string }): Promise<StreamInfo> {
+  public async getStream(
+    id: string,
+    metadata?: { title?: string; artist?: string; duration?: number }
+  ): Promise<StreamInfo> {
     if (!id || typeof id !== 'string' || id.trim().length === 0) {
       return {
         streamUrl: '',
@@ -1753,31 +1756,36 @@ class YouTubeMusicService {
       return cached.data;
     }
 
-    // 1. Primary: High-fidelity JioSaavn 320kbps MP4 CDN resolution
-    // Provides 100% native HTML5 audio stream for background and lock-screen playback
-    const titleToSearch = (metadata as any)?.title || this.songCache.get(cleanId)?.data?.title;
+    // 1. Primary: JioSaavn 320 kbps AAC.
+    //    Real, playable audio that does not depend on this server's IP reputation (YouTube
+    //    refuses stream extraction from datacenter IPs). The resolved URL is CDN-hosted with
+    //    Range + CORS support, so the client plays it directly with no proxy hop.
+    const cachedSong = this.songCache.get(cleanId)?.data;
+    const titleToSearch = metadata?.title || cachedSong?.title || '';
     const artistToSearch =
-      (metadata as any)?.artist ||
-      this.songCache.get(cleanId)?.data?.artist ||
-      (this.songCache.get(cleanId)?.data as any)?.artists ||
-      '';
+      metadata?.artist || cachedSong?.artist || (cachedSong as any)?.artists || '';
+    const durationHint = metadata?.duration || cachedSong?.duration;
 
     if (titleToSearch) {
       try {
-        const jio = await jioSaavnService.searchTrack(titleToSearch, artistToSearch);
-        if (jio && jio.streamUrl320) {
-          const jioStream: StreamInfo = {
-            streamUrl: jio.streamUrl320,
+        const saavn = await jioSaavnService.findTrack(
+          titleToSearch,
+          artistToSearch,
+          durationHint
+        );
+        if (saavn?.streamUrl320) {
+          const saavnStream: StreamInfo = {
+            streamUrl: saavn.streamUrl320,
             available: true,
             format: 'audio/mp4',
             bitrate: 320000,
-            duration: jio.duration,
+            duration: saavn.duration || cachedSong?.duration,
           };
-          this.streamCache.set(cleanId, { data: jioStream, expires: Date.now() + 6 * 3600 * 1000 });
-          return jioStream;
+          this.streamCache.set(cleanId, { data: saavnStream, expires: Date.now() + 6 * 3600 * 1000 });
+          return saavnStream;
         }
       } catch (err: any) {
-        console.warn(`[getStream] JioSaavn resolution note for ${titleToSearch}:`, err?.message || err);
+        console.warn('[getStream] JioSaavn match notice:', err?.message || err);
       }
     }
 

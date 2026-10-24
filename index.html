@@ -48,7 +48,6 @@
     <link rel="shortcut icon" href="/favicon.ico" />
     <link rel="icon" type="image/svg+xml" href="/icon.svg" />
     <link rel="manifest" href="/manifest.webmanifest" />
-    <script src="https://www.youtube.com/iframe_api"></script>
     <style>
       /* Complete scrollbar elimination for all browsers */
       html, body, #root, * {
@@ -68,28 +67,23 @@
     </style>
   </head>
   <body class="bg-[#000000] text-white selection:bg-white/20 selection:text-white antialiased overflow-x-hidden">
-    <!-- Spotify Web Architecture: Persistent Audio Element for background & lockscreen playback -->
-    <audio id="audioPlayer" preload="auto" playsinline webkit-playsinline x5-playsinline style="position:fixed;bottom:0px;right:0px;width:1px;height:1px;opacity:0.001;pointer-events:none;z-index:-10;"></audio>
+    <!-- Persistent player element: the ONE audio sink for the whole app.
+         Kept in the document from first paint so iOS WebKit keeps the audio session
+         (AVAudioSessionCategoryPlayback) alive through screen lock, app switching and
+         Control Center / lock-screen controls. Never recreate or replace this node. -->
+    <audio
+      id="audioPlayer"
+      preload="auto"
+      playsinline
+      webkit-playsinline
+      x5-playsinline
+      x-webkit-airplay="allow"
+      style="position:fixed;bottom:0px;right:0px;width:1px;height:1px;opacity:0.001;pointer-events:none;z-index:-10;"
+    ></audio>
     <!-- Embedded YouTube Iframe target container for YouTube releases -->
     <div id="yt-player-target" style="position:fixed;bottom:0;right:0;width:2px;height:2px;opacity:0.001;pointer-events:none;z-index:-10;"></div>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
-    <script>
-      if ('serviceWorker' in navigator) {
-        navigator.serviceWorker.getRegistrations().then(function(registrations) {
-          for (var i = 0; i < registrations.length; i++) {
-            registrations[i].unregister();
-          }
-        });
-      }
-      if ('caches' in window) {
-        caches.keys().then(function(names) {
-          for (var i = 0; i < names.length; i++) {
-            caches.delete(names[i]);
-          }
-        });
-      }
-    </script>
   </body>
 </html>
 
